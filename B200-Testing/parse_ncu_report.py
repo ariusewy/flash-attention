@@ -110,23 +110,62 @@ def _strip_num(s: str):
 def _looks_like_csv(text: str) -> bool:
     """Cheap sanity check: does this look like NCU's --csv output?
 
-    We don't trust ncu's exit code on --import — NCU 2025.x can return 1
-    because the in-report RuleResults fail re-evaluation (e.g. when section
-    files aren't in NSIGHT_COMPUTE_SECTIONS_PATH) while still emitting a
-    perfectly fine CSV body on stdout. Accept anything whose first line
-    starts with a quoted column header (raw page) or contains the canonical
-    'Metric Name'/'Metric Value' header (details page).
+    Reject NCU diagnostic text (==WARNING== / ==ERROR== / libprotobuf) that
+    sometimes lands on stdout when `ncu --import` fails under sudo or when
+    section files are missing.
     """
-    if not text:
+    if not text or not text.strip():
         return False
-    head = text.lstrip().splitlines()[0] if text.strip() else ""
-    if head.startswith('"ID"') or head.startswith("\"Process ID\""):
+    head = text.lstrip().splitlines()[0].strip()
+    if head.startswith("==WARNING==") or head.startswith("==ERROR=="):
+        return False
+    if head.startswith("[libprotobuf"):
+        return False
+    if head.startswith('"ID"') or head.startswith('"Process ID"'):
         return True
     if "Metric Name" in head and "Metric Value" in head:
         return True
-    # Fall back to "has at least one comma in the first line" — looser but
-    # still rules out plain error text.
-    return "," in head
+    return False
+
+
+def _discover_ncu_bin(explicit: str = "") -> str:
+    """Resolve the same `ncu` the operator uses in their conda shell."""
+    from shutil import which
+
+    candidates = [
+        explicit,
+        os.environ.get("NCU_BIN", ""),
+        which("ncu") or "",
+        "/usr/local/cuda/bin/ncu",
+        "/opt/nvidia/nsight-compute/ncu",
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        p = c if os.path.isabs(c) else (which(c) or "")
+        if p and os.path.isfile(p) and os.access(p, os.X_OK):
+            return os.path.realpath(p)
+    return explicit or "ncu"
+
+
+def _find_cached_csv(ncu_path: str):
+    """Return (csv_text, tag) if a pre-exported CSV sits next to the .ncu-rep."""
+    rep = Path(ncu_path).resolve()
+    d = rep.parent
+    for name, tag in (
+        ("profile_raw.csv", "cached_raw"),
+        ("profile.csv", "cached_details"),
+    ):
+        p = d / name
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _looks_like_csv(text):
+            return text, tag
+    return None, None
 
 
 def _discover_sections_path(ncu_bin: str) -> str:
@@ -413,7 +452,13 @@ def parse_ncu_csv(text: str, source: str) -> dict:
 
 
 def parse_ncu_rep(ncu_path: str, ncu_bin: str = NCU_BIN) -> dict:
-    """Top-level entry: export + parse a single .ncu-rep file."""
+    """Top-level entry: parse a .ncu-rep (cached CSV first, else ncu --import)."""
+    cached, tag = _find_cached_csv(ncu_path)
+    if cached is not None:
+        result = parse_ncu_csv(cached, os.path.basename(ncu_path))
+        result["page_used"] = tag
+        return result
+
     text, page_used = export_csv_text(ncu_path, ncu_bin=ncu_bin)
     result = parse_ncu_csv(text, os.path.basename(ncu_path))
     result["page_used"] = page_used
@@ -551,7 +596,17 @@ def main():
                         help=f"Path to ncu binary (default: {NCU_BIN})")
     args = parser.parse_args()
 
-    ncu_bin = args.ncu_bin
+    ncu_bin = _discover_ncu_bin(args.ncu_bin)
+
+    if os.geteuid() == 0:
+        print(
+            "[warn] Running as root/sudo: `ncu --import` often fails because "
+            "PATH and NSIGHT_COMPUTE_SECTIONS_PATH differ from your conda shell.\n"
+            "       Prefer: python3 parse_ncu_report.py ...   (no sudo)\n"
+            "       Or export CSV first:\n"
+            "         ncu --import profile.ncu-rep --page raw --csv > profile_raw.csv",
+            file=sys.stderr,
+        )
 
     results = []
     for path in args.reports:

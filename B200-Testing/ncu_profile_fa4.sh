@@ -228,25 +228,61 @@ set -e
 echo "[ncu] NCU exit code: $NCU_RC (124 = timeout)"
 
 # ---------------------------------------------------------------------------
-# 4. Export CSV from raw report
+# 4. Export CSV from raw report (do this in the SAME env that ran ncu)
 # ---------------------------------------------------------------------------
+_discover_ncu() {
+  for c in \
+    "${NCU_BIN:-}" \
+    "$(command -v ncu 2>/dev/null || true)" \
+    /usr/local/cuda/bin/ncu; do
+    [[ -z "$c" ]] && continue
+    [[ -x "$c" ]] && echo "$c" && return 0
+  done
+  return 1
+}
+_discover_sections() {
+  local ncu="$1"
+  if [[ -n "${NSIGHT_COMPUTE_SECTIONS_PATH:-}" && -d "$NSIGHT_COMPUTE_SECTIONS_PATH" ]]; then
+    echo "$NSIGHT_COMPUTE_SECTIONS_PATH"; return 0
+  fi
+  local root
+  root="$(dirname "$(dirname "$(readlink -f "$ncu" 2>/dev/null || echo "$ncu")")")"
+  if [[ -d "$root/sections" ]]; then echo "$root/sections"; return 0; fi
+  for d in /usr/local/cuda/nsight-compute/sections /opt/nvidia/nsight-compute/sections; do
+    [[ -d "$d" ]] && echo "$d" && return 0
+  done
+  return 1
+}
+
 if [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
-  echo "[ncu] Exporting CSV from profile.ncu-rep..."
-  ncu --import "$OUTDIR/profile.ncu-rep" --csv --page details \
-      > "$OUTDIR/profile.csv" 2> "$OUTDIR/ncu_import.log" || true
-  echo "[ncu] CSV rows: $(wc -l < "$OUTDIR/profile.csv")"
+  NCU_BIN="$(_discover_ncu)" || NCU_BIN="ncu"
+  SECTIONS="$(_discover_sections "$NCU_BIN" 2>/dev/null || true)"
+  SF=()
+  [[ -n "$SECTIONS" ]] && SF=(--section-folder "$SECTIONS")
+
+  echo "[ncu] Exporting profile_raw.csv (preferred for offline parse)..."
+  ncu --import "$OUTDIR/profile.ncu-rep" "${SF[@]}" --page raw --csv \
+    > "$OUTDIR/profile_raw.csv" 2> "$OUTDIR/ncu_import_raw.log" || true
+  echo "[ncu] profile_raw.csv rows: $(wc -l < "$OUTDIR/profile_raw.csv" 2>/dev/null || echo 0)"
+
+  echo "[ncu] Exporting profile.csv (details page, optional)..."
+  ncu --import "$OUTDIR/profile.ncu-rep" "${SF[@]}" --page details --csv \
+    > "$OUTDIR/profile.csv" 2> "$OUTDIR/ncu_import.log" || true
+  echo "[ncu] profile.csv rows: $(wc -l < "$OUTDIR/profile.csv" 2>/dev/null || echo 0)"
 else
   echo "[ncu] WARNING: no profile.ncu-rep produced. Check ncu_run.log for errors."
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Parse summary (if parse script exists)
+# 5. Parse summary (if parse script exists) — NO sudo
 # ---------------------------------------------------------------------------
 if [[ -f "$HERE/parse_ncu_report.py" ]] && [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
-  echo "[ncu] Parsing report to summary.json..."
+  echo "[ncu] Parsing report to summary.json (via $PYTHON_BIN, no sudo)..."
   "$PYTHON_BIN" "$HERE/parse_ncu_report.py" \
-    "$OUTDIR/profile.ncu-rep" -o "$OUTDIR/summary.json" 2>/dev/null || {
-    echo "[warn] parse_ncu_report.py failed; skipping summary.json"
+    "$OUTDIR/profile.ncu-rep" -o "$OUTDIR/summary.json" \
+    --csv "$OUTDIR/profile_calib.csv" 2>/dev/null || {
+    echo "[warn] parse_ncu_report.py failed; re-run later:"
+    echo "       bash $HERE/reparse_ncu_fa3align.sh"
   }
 fi
 
