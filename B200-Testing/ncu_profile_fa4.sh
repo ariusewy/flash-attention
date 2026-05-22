@@ -203,6 +203,8 @@ set +e
 timeout "$PROFILE_TIMEOUT" ncu \
   --target-processes all \
   --clock-control=none \
+  --nvtx \
+  --nvtx-include "FA4_FWD/" \
   "${SECTIONS[@]}" \
   "${METRICS_FLAG[@]}" \
   -o "$OUTDIR/profile" \
