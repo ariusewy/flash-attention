@@ -108,8 +108,13 @@ def _strip_num(s: str):
 
 
 def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> str:
-    """Run `ncu --import <file> --page raw --csv` and return stdout text."""
-    cmd = [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv"]
+    """Run `ncu --import <file> --page raw --csv --units base` and return stdout text.
+
+    `--units base` forces fixed base units (ns / byte / cycle) instead of
+    adaptive (us/ms, KB/MB/GB), so downstream parsing can trust the values.
+    """
+    cmd = [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv",
+           "--units", "base"]
     try:
         result = subprocess.run(
             cmd,
@@ -175,10 +180,19 @@ def parse_ncu_csv(text: str, source: str) -> dict:
                 pass
 
         # Calibration metrics
+        # With --units base, NCU emits ns/byte. Convert to friendly units
+        # to keep field-name semantics (duration_us, dram_bytes_*, tma_*_bytes).
         for metric, field in CALIB_METRICS.items():
             if metric in col_idx:
                 raw = row[col_idx[metric]] if col_idx[metric] < len(row) else ""
-                entry[field] = _strip_num(raw)
+                val = _strip_num(raw)
+                if isinstance(val, (int, float)):
+                    if field.endswith("_us"):
+                        # gpu__time_duration.sum is in ns under --units base
+                        val = val / 1000.0
+                    # Note: dram_bytes_* / tma_*_bytes remain in raw bytes
+                    # (field name is already in bytes, no conversion needed).
+                entry[field] = val
 
         # Keep the full raw metric dict so callers can extract anything else
         raw_metrics = {}
