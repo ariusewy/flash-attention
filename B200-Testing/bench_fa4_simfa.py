@@ -234,9 +234,14 @@ def mode_perf(args):
         print(f"\n--- Case {i}: {_case_label(b, s, hq, hkv, d)} ---")
         q, k, v = make_inputs(b, s, hq, hkv, d)
 
-        # Warmup
+        # Warmup — FA4 CuTeDSL JIT-compiles each new shape on first call,
+        # which can take ~300-500ms. We need enough warmups with sync to ensure
+        # compilation finishes before timing begins.
         for _ in range(args.warmup):
             _ = run_fa4(q, k, v, hkv)
+            torch.cuda.synchronize()
+        # Extra sync + one more discard call to be safe
+        _ = run_fa4(q, k, v, hkv)
         torch.cuda.synchronize()
 
         # Timed runs
@@ -351,7 +356,7 @@ def main():
     # Misc
     parser.add_argument("--no-backward", action="store_true",
                         help="Skip backward pass")
-    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters",  type=int, default=10)
     parser.add_argument("--output", "-o", default=None,
                         help="Save perf results as JSON")
