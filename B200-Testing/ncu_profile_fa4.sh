@@ -52,6 +52,29 @@ FULL_METRICS="${FULL_METRICS:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
+# Detect Python with torch — sudo strips conda PATH.
+# Override with: PYTHON_BIN=$(which python3) sudo -E bash ncu_profile_fa4.sh ...
+_find_python() {
+  for c in \
+    "${PYTHON_BIN:-}" \
+    "$(command -v python3 2>/dev/null || true)" \
+    /mnt/nvme3n1/conda/envs/b200_fa3/bin/python3 \
+    /mnt/nvme2n1/conda/envs/b200_fa3/bin/python3 \
+    /opt/conda/envs/b200_fa3/bin/python3 \
+    /opt/conda/bin/python3 \
+    /usr/local/bin/python3; do
+    [[ -z "$c" ]] && continue
+    if "$c" -c "import torch" 2>/dev/null; then echo "$c"; return 0; fi
+  done
+  return 1
+}
+PYTHON_BIN="$(_find_python)" || {
+  echo "[error] No python3 with torch found. Set PYTHON_BIN explicitly:"
+  echo "  PYTHON_BIN=\$(which python3) sudo -E bash $0 ..."
+  exit 1
+}
+echo "[ncu] Python: $PYTHON_BIN  torch=$("$PYTHON_BIN" -c 'import torch; print(torch.__version__)' 2>/dev/null)"
+
 # Parse our own flags (everything before -- is ours, after -- goes to bench)
 SEQLEN=128
 HEADDIM=64
@@ -147,7 +170,7 @@ trap cleanup EXIT INT TERM
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 
 # Python command
-PYTHON_CMD="python3 $HERE/bench_fa4_simfa.py"
+PYTHON_CMD="$PYTHON_BIN $HERE/bench_fa4_simfa.py"
 PYTHON_CMD="$PYTHON_CMD --mode run_once --seqlen $SEQLEN --headdim $HEADDIM --heads $HEADS --heads-kv $HEADS_KV --batch $BATCH $NO_BWD"
 
 # NCU sections + metrics
@@ -240,7 +263,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -f "$HERE/parse_ncu_report.py" ]] && [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
   echo "[ncu] Parsing report to summary.json..."
-  python3 "$HERE/parse_ncu_report.py" \
+  "$PYTHON_BIN" "$HERE/parse_ncu_report.py" \
     "$OUTDIR/profile.ncu-rep" -o "$OUTDIR/summary.json" 2>/dev/null || {
     echo "[warn] parse_ncu_report.py failed; skipping summary.json"
   }
