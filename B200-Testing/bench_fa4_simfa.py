@@ -235,14 +235,12 @@ def mode_perf(args):
         q, k, v = make_inputs(b, s, hq, hkv, d)
 
         # Warmup — FA4 CuTeDSL JIT-compiles each new shape on first call,
-        # which can take ~300-500ms. We need enough warmups with sync to ensure
-        # compilation finishes before timing begins.
+        # which can take ~300-500ms. Sync inside the loop so each call
+        # completes (including any Python-level JIT compilation) before
+        # the next one starts.
         for _ in range(args.warmup):
             _ = run_fa4(q, k, v, hkv)
             torch.cuda.synchronize()
-        # Extra sync + one more discard call to be safe
-        _ = run_fa4(q, k, v, hkv)
-        torch.cuda.synchronize()
 
         # Timed runs
         fwd_times, bwd_times = [], []
