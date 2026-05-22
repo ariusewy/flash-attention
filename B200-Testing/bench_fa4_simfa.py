@@ -327,11 +327,15 @@ def mode_run_once(args):
         torch.cuda.synchronize()
 
     # Single timed invocation (nsys/NCU will capture the kernel)
-    import nvtx
-    nvtx.push_range("FA4_FWD")
-    out = run_fa4(q, k, v, hkv)
-    torch.cuda.synchronize()
-    nvtx.pop_range()
+    try:
+        import nvtx
+        nvtx.push_range("FA4_FWD")
+        out = run_fa4(q, k, v, hkv)
+        torch.cuda.synchronize()
+        nvtx.pop_range()
+    except ImportError:
+        out = run_fa4(q, k, v, hkv)
+        torch.cuda.synchronize()
 
     print(f"  output: {out.shape}  dtype={out.dtype}")
 
