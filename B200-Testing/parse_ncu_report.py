@@ -130,20 +130,29 @@ def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> tuple:
 
     Raises RuntimeError with both attempts' stderr if every variant fails.
     """
+    # NCU 2025.3+ dropped `--units` on `--import` (prints an "unrecognised
+    # option" error and emits empty stdout while still exiting 0). Older NCU
+    # supported it. We try the no-`--units` variants first because they work
+    # on every version we've seen; the parser normalises adaptive units
+    # (us/Mbyte/Ghz/...) back to ns/byte/Hz so the downstream schema is
+    # identical whether or not NCU happened to honour `--units base`.
     attempts = [
-        ("raw", [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv",
-                 "--units", "base"]),
-        ("raw_noUnits", [ncu_bin, "--import", ncu_path, "--page", "raw",
-                         "--csv"]),
-        ("details", [ncu_bin, "--import", ncu_path, "--page", "details",
-                     "--csv", "--units", "base"]),
-        ("details_noUnits", [ncu_bin, "--import", ncu_path, "--page",
-                             "details", "--csv"]),
+        ("raw",            [ncu_bin, "--import", ncu_path, "--page", "raw",
+                            "--csv"]),
+        ("details",        [ncu_bin, "--import", ncu_path, "--page", "details",
+                            "--csv"]),
+        ("raw_baseUnits",  [ncu_bin, "--import", ncu_path, "--page", "raw",
+                            "--csv", "--units", "base"]),
+        ("details_baseUnits", [ncu_bin, "--import", ncu_path, "--page",
+                               "details", "--csv", "--units", "base"]),
     ]
 
     errors = []
     for tag, cmd in attempts:
         rc, out, err = _run_ncu_import(cmd)
+        # Accept only when ncu actually emitted a CSV body. NCU 2025.x can
+        # exit 0 with an empty stdout when it dislikes a flag, so checking
+        # the body is the only reliable signal.
         if rc == 0 and out.strip():
             return out, tag
         errors.append(f"[{tag}] rc={rc} stderr={err.strip()[:300] or '(empty)'} "
@@ -153,13 +162,53 @@ def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> tuple:
                        + "\n".join(errors))
 
 
+def _normalise_to_base(val, unit: str):
+    """Convert NCU adaptive units to ns / byte / cycle (== `--units base`).
+
+    NCU 2025.x does not accept `--units` on `--import`, so the raw-page CSV
+    always uses adaptive units (e.g. us, Mbyte, Kbyte, Ghz). Normalising here
+    means downstream logic can treat every metric as if it had been exported
+    with `--units base`.
+
+    Unknown units (e.g. %, sector, inst, warp, register/thread, byte/block)
+    pass through unchanged.
+    """
+    if not isinstance(val, (int, float)):
+        return val
+    u = unit.strip().lower()
+    # time -> ns
+    if u in ("us", "usecond"):                return val * 1e3
+    if u in ("ms", "msecond"):                return val * 1e6
+    if u in ("s",  "second"):                 return val * 1e9
+    if u in ("ns", "nsecond"):                return val
+    # bytes -> byte
+    if u in ("byte",):                        return val
+    if u in ("kbyte", "kib"):                 return val * 1024.0
+    if u in ("mbyte", "mib"):                 return val * 1024.0 ** 2
+    if u in ("gbyte", "gib"):                 return val * 1024.0 ** 3
+    if u in ("tbyte", "tib"):                 return val * 1024.0 ** 4
+    # throughput per-second -> bytes/s
+    if u in ("kbyte/s", "kib/s"):             return val * 1024.0
+    if u in ("mbyte/s", "mib/s"):             return val * 1024.0 ** 2
+    if u in ("gbyte/s", "gib/s"):             return val * 1024.0 ** 3
+    if u in ("tbyte/s", "tib/s"):             return val * 1024.0 ** 4
+    # frequency -> Hz
+    if u in ("khz",):                         return val * 1e3
+    if u in ("mhz",):                         return val * 1e6
+    if u in ("ghz",):                         return val * 1e9
+    return val
+
+
 def _finalise_kernel(entry: dict, metric_map: dict) -> dict:
-    """Promote CALIB_METRICS into top-level fields and store raw map."""
+    """Promote CALIB_METRICS into top-level fields and store raw map.
+
+    `metric_map` must already be normalised to ns / byte / cycle.
+    """
     for metric, field in CALIB_METRICS.items():
         if metric in metric_map:
             val = metric_map[metric]
             if isinstance(val, (int, float)) and field.endswith("_us"):
-                # gpu__time_duration.sum is ns under `--units base`.
+                # gpu__time_duration.sum lives in ns (after normalisation).
                 val = val / 1000.0
             entry[field] = val
     entry["_raw"] = metric_map
@@ -167,15 +216,15 @@ def _finalise_kernel(entry: dict, metric_map: dict) -> dict:
 
 
 def _parse_raw_page(rows: list, source: str) -> dict:
-    """Original NCU 'raw' page CSV: header + units + one row per kernel."""
+    """NCU 'raw' page CSV: header + units row + one row per kernel."""
     if len(rows) < 3:
         return {"source": source, "kernels": [],
                 "note": "raw page: <3 rows"}
 
-    headers = rows[0]
-    # rows[1] is units row — skip
+    headers   = rows[0]
+    units_row = rows[1]
     data_rows = rows[2:]
-    col_idx = {h: i for i, h in enumerate(headers)}
+    col_idx   = {h: i for i, h in enumerate(headers)}
 
     kernels = []
     for row in data_rows:
@@ -196,8 +245,11 @@ def _parse_raw_page(rows: list, source: str) -> dict:
         for h, i in col_idx.items():
             if h in FIXED_COLS:
                 continue
-            val = row[i] if i < len(row) else ""
-            metric_map[h] = _strip_num(val)
+            raw_val = row[i] if i < len(row) else ""
+            val = _strip_num(raw_val)
+            unit = units_row[i] if i < len(units_row) else ""
+            val = _normalise_to_base(val, unit)
+            metric_map[h] = val
 
         kernels.append(_finalise_kernel(entry, metric_map))
 
@@ -244,24 +296,10 @@ def _parse_details_page(rows: list, source: str) -> dict:
         raw_val     = row[value_col].strip() if value_col < len(row) else ""
         if not metric_name:
             continue
-        val = _strip_num(raw_val)
-
-        # `--units base` is best-effort; if user runs without it, NCU may emit
-        # values in adaptive units (us / KB / MB). Normalise ns/byte when the
-        # unit column tells us what we're looking at.
-        if unit_col is not None and unit_col < len(row):
-            unit = row[unit_col].strip().lower()
-            if isinstance(val, (int, float)):
-                if unit in ("us", "usecond"):
-                    val = val * 1000.0      # → ns
-                elif unit in ("ms", "msecond"):
-                    val = val * 1_000_000.0
-                elif unit in ("kbyte", "kib"):
-                    val = val * 1024.0
-                elif unit in ("mbyte", "mib"):
-                    val = val * 1024.0 ** 2
-                elif unit in ("gbyte", "gib"):
-                    val = val * 1024.0 ** 3
+        val  = _strip_num(raw_val)
+        unit = row[unit_col].strip() if (unit_col is not None
+                                          and unit_col < len(row)) else ""
+        val = _normalise_to_base(val, unit)
         bucket["metrics"][metric_name] = val
 
     kernels = []
