@@ -320,7 +320,19 @@ def mode_run_once(args):
     print(f"run_once: {_case_label(b, s, hq, hkv, d)}")
 
     q, k, v = make_inputs(b, s, hq, hkv, d)
+
+    # Warmup to flush JIT compilation before the timed call
+    for _ in range(args.warmup):
+        _ = run_fa4(q, k, v, hkv)
+        torch.cuda.synchronize()
+
+    # Single timed invocation (nsys/NCU will capture the kernel)
+    import nvtx
+    nvtx.push_range("FA4_FWD")
     out = run_fa4(q, k, v, hkv)
+    torch.cuda.synchronize()
+    nvtx.pop_range()
+
     print(f"  output: {out.shape}  dtype={out.dtype}")
 
     if not args.no_backward:
