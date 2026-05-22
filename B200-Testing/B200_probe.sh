@@ -125,10 +125,23 @@ if torch.cuda.is_available():
               f'{props.multi_processor_count} SMs, '
               f'{props.total_memory / 1e9:.1f} GB')
 
-    # Quick FA4 check
-    try:
-        from flash_attn_interface import flash_attn_func
-        print('FA4: flash_attn_func available')
+    # Quick FA4 check — try multiple import paths
+    fa4_source = None
+    for _mod_path in [
+        "flash_attn_interface",       # FA4 official pip package
+        "flash_attn.cute.interface",  # FA4 editable / CuTeDSL path
+        "flash_attn",                 # FA3 / FA2 fallback (MHA only)
+    ]:
+        try:
+            _mod = __import__(_mod_path, fromlist=["flash_attn_func"])
+            flash_attn_func = _mod.flash_attn_func
+            fa4_source = _mod_path
+            break
+        except (ImportError, AttributeError):
+            continue
+
+    if fa4_source is not None:
+        print(f'FA4: flash_attn_func available  source={fa4_source}')
 
         # Minimal test
         q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16, device='cuda')
@@ -137,12 +150,8 @@ if torch.cuda.is_available():
         out = flash_attn_func(q, k, v)
         torch.cuda.synchronize()
         print(f'FA4 smoke test: PASS (output shape={out.shape})')
-    except ImportError:
-        try:
-            from flash_attn import flash_attn_func
-            print('FA4: flash_attn available (flash_attn module)')
-        except ImportError:
-            print('FA4: NOT AVAILABLE (install flash-attn-4)')
+    else:
+        print('FA4: NOT AVAILABLE (install flash-attn-4)')
     except Exception as e:
         print(f'FA4 smoke test: FAILED ({e})')
 else:
