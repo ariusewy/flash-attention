@@ -107,56 +107,74 @@ def _strip_num(s: str):
         return s
 
 
-def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> str:
-    """Run `ncu --import <file> --page raw --csv --units base` and return stdout text.
-
-    `--units base` forces fixed base units (ns / byte / cycle) instead of
-    adaptive (us/ms, KB/MB/GB), so downstream parsing can trust the values.
-    """
-    cmd = [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv",
-           "--units", "base"]
+def _run_ncu_import(cmd: list, timeout: int = 120):
+    """Invoke `ncu --import ...` and return (returncode, stdout, stderr)."""
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=timeout)
     except FileNotFoundError:
-        raise RuntimeError(
-            f"`{ncu_bin}` not found. Ensure ncu is on PATH."
-        )
+        raise RuntimeError(f"`{cmd[0]}` not found. Ensure ncu is on PATH.")
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"ncu timed out on {ncu_path}")
-
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"ncu exited {result.returncode}:\n{result.stderr[:500]}"
-        )
-    return result.stdout
+        raise RuntimeError(f"ncu timed out: {' '.join(cmd)}")
+    return result.returncode, result.stdout, result.stderr
 
 
-def parse_ncu_csv(text: str, source: str) -> dict:
+def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> tuple:
+    """Return (csv_text, page_used) for a .ncu-rep file.
+
+    Strategy:
+      1. Try `--page raw --csv --units base` (one row per kernel, base units).
+      2. If that fails (newer NCU drops the `raw` page or `--units base`
+         on some reports), fall back to `--page details --csv` (one row per
+         metric per kernel; parser auto-detects layout).
+
+    Raises RuntimeError with both attempts' stderr if every variant fails.
     """
-    Parse the raw-page CSV text returned by ncu.
+    attempts = [
+        ("raw", [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv",
+                 "--units", "base"]),
+        ("raw_noUnits", [ncu_bin, "--import", ncu_path, "--page", "raw",
+                         "--csv"]),
+        ("details", [ncu_bin, "--import", ncu_path, "--page", "details",
+                     "--csv", "--units", "base"]),
+        ("details_noUnits", [ncu_bin, "--import", ncu_path, "--page",
+                             "details", "--csv"]),
+    ]
 
-    Returns a dict:
-      {
-        "source":  "<filename>",
-        "kernels": [ {kernel fields + metrics...}, ... ]
-      }
-    """
-    reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
+    errors = []
+    for tag, cmd in attempts:
+        rc, out, err = _run_ncu_import(cmd)
+        if rc == 0 and out.strip():
+            return out, tag
+        errors.append(f"[{tag}] rc={rc} stderr={err.strip()[:300] or '(empty)'} "
+                      f"stdout_head={out.strip()[:120] or '(empty)'}")
 
+    raise RuntimeError("ncu --import failed for every page/units variant:\n"
+                       + "\n".join(errors))
+
+
+def _finalise_kernel(entry: dict, metric_map: dict) -> dict:
+    """Promote CALIB_METRICS into top-level fields and store raw map."""
+    for metric, field in CALIB_METRICS.items():
+        if metric in metric_map:
+            val = metric_map[metric]
+            if isinstance(val, (int, float)) and field.endswith("_us"):
+                # gpu__time_duration.sum is ns under `--units base`.
+                val = val / 1000.0
+            entry[field] = val
+    entry["_raw"] = metric_map
+    return entry
+
+
+def _parse_raw_page(rows: list, source: str) -> dict:
+    """Original NCU 'raw' page CSV: header + units + one row per kernel."""
     if len(rows) < 3:
-        return {"source": source, "kernels": [], "note": "no kernel data in report"}
+        return {"source": source, "kernels": [],
+                "note": "raw page: <3 rows"}
 
-    headers = rows[0]   # column names
-    # rows[1] is units — skip
+    headers = rows[0]
+    # rows[1] is units row — skip
     data_rows = rows[2:]
-
-    # Build lookup: header string -> column index
     col_idx = {h: i for i, h in enumerate(headers)}
 
     kernels = []
@@ -165,53 +183,123 @@ def parse_ncu_csv(text: str, source: str) -> dict:
             continue
 
         entry = {"_source": source}
-
-        # Fixed identity columns
         for header, field in FIXED_COLS.items():
-            if header in col_idx:
-                val = row[col_idx[header]] if col_idx[header] < len(row) else ""
-                entry[field] = val.strip()
-
-        # Cast id to int
+            if header in col_idx and col_idx[header] < len(row):
+                entry[field] = row[col_idx[header]].strip()
         if "id" in entry:
             try:
                 entry["id"] = int(entry["id"])
             except (ValueError, TypeError):
                 pass
 
-        # Calibration metrics
-        # With --units base, NCU emits ns/byte. Convert to friendly units
-        # to keep field-name semantics (duration_us, dram_bytes_*, tma_*_bytes).
-        for metric, field in CALIB_METRICS.items():
-            if metric in col_idx:
-                raw = row[col_idx[metric]] if col_idx[metric] < len(row) else ""
-                val = _strip_num(raw)
-                if isinstance(val, (int, float)):
-                    if field.endswith("_us"):
-                        # gpu__time_duration.sum is in ns under --units base
-                        val = val / 1000.0
-                    # Note: dram_bytes_* / tma_*_bytes remain in raw bytes
-                    # (field name is already in bytes, no conversion needed).
-                entry[field] = val
-
-        # Keep the full raw metric dict so callers can extract anything else
-        raw_metrics = {}
+        metric_map = {}
         for h, i in col_idx.items():
             if h in FIXED_COLS:
                 continue
             val = row[i] if i < len(row) else ""
-            raw_metrics[h] = _strip_num(val)
-        entry["_raw"] = raw_metrics
+            metric_map[h] = _strip_num(val)
 
-        kernels.append(entry)
+        kernels.append(_finalise_kernel(entry, metric_map))
 
     return {"source": source, "kernels": kernels}
 
 
+def _parse_details_page(rows: list, source: str) -> dict:
+    """NCU 'details' page CSV: long format with one row per (kernel, metric).
+
+    Columns typically include:
+      ID, Process ID, Process Name, Host Name, Kernel Name,
+      Block Size, Grid Size, Device, CC, Section Name,
+      Metric Name, Metric Unit, Metric Value
+    """
+    if len(rows) < 2:
+        return {"source": source, "kernels": [],
+                "note": "details page: empty"}
+
+    headers = rows[0]
+    col_idx = {h: i for i, h in enumerate(headers)}
+
+    name_col  = col_idx.get("Metric Name")
+    value_col = col_idx.get("Metric Value")
+    unit_col  = col_idx.get("Metric Unit")
+    if name_col is None or value_col is None:
+        return {"source": source, "kernels": [],
+                "note": "details page: missing Metric Name/Value columns"}
+
+    # Group rows by (kernel ID, Kernel Name) so multi-kernel reports stay split.
+    grouped = {}  # key -> dict(identity + metric_map)
+    for row in rows[1:]:
+        if not row:
+            continue
+        identity = {}
+        for header, field in FIXED_COLS.items():
+            if header in col_idx and col_idx[header] < len(row):
+                identity[field] = row[col_idx[header]].strip()
+
+        key = (identity.get("id", ""), identity.get("kernel_name", ""))
+        bucket = grouped.setdefault(key, {"identity": identity,
+                                          "metrics": {}})
+
+        metric_name = row[name_col].strip() if name_col < len(row) else ""
+        raw_val     = row[value_col].strip() if value_col < len(row) else ""
+        if not metric_name:
+            continue
+        val = _strip_num(raw_val)
+
+        # `--units base` is best-effort; if user runs without it, NCU may emit
+        # values in adaptive units (us / KB / MB). Normalise ns/byte when the
+        # unit column tells us what we're looking at.
+        if unit_col is not None and unit_col < len(row):
+            unit = row[unit_col].strip().lower()
+            if isinstance(val, (int, float)):
+                if unit in ("us", "usecond"):
+                    val = val * 1000.0      # → ns
+                elif unit in ("ms", "msecond"):
+                    val = val * 1_000_000.0
+                elif unit in ("kbyte", "kib"):
+                    val = val * 1024.0
+                elif unit in ("mbyte", "mib"):
+                    val = val * 1024.0 ** 2
+                elif unit in ("gbyte", "gib"):
+                    val = val * 1024.0 ** 3
+        bucket["metrics"][metric_name] = val
+
+    kernels = []
+    for (kid, _), bucket in grouped.items():
+        entry = {"_source": source}
+        entry.update(bucket["identity"])
+        if "id" in entry:
+            try:
+                entry["id"] = int(entry["id"])
+            except (ValueError, TypeError):
+                pass
+        kernels.append(_finalise_kernel(entry, bucket["metrics"]))
+
+    # Stable sort by ID when available
+    kernels.sort(key=lambda k: (k.get("id") if isinstance(k.get("id"), int)
+                                else 1 << 30))
+    return {"source": source, "kernels": kernels}
+
+
+def parse_ncu_csv(text: str, source: str) -> dict:
+    """Parse NCU --csv text, auto-detecting raw vs details page layout."""
+    reader = csv.reader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        return {"source": source, "kernels": [], "note": "empty csv"}
+
+    headers = rows[0]
+    if "Metric Name" in headers and "Metric Value" in headers:
+        return _parse_details_page(rows, source)
+    return _parse_raw_page(rows, source)
+
+
 def parse_ncu_rep(ncu_path: str, ncu_bin: str = NCU_BIN) -> dict:
     """Top-level entry: export + parse a single .ncu-rep file."""
-    text = export_csv_text(ncu_path, ncu_bin=ncu_bin)
-    return parse_ncu_csv(text, os.path.basename(ncu_path))
+    text, page_used = export_csv_text(ncu_path, ncu_bin=ncu_bin)
+    result = parse_ncu_csv(text, os.path.basename(ncu_path))
+    result["page_used"] = page_used
+    return result
 
 
 # ── CSV output ────────────────────────────────────────────────────────────────
