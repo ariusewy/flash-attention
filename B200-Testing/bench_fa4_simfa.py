@@ -147,19 +147,21 @@ def pytorch_sdpa_ref(q, k, v, heads_q, heads_kv):
 
 
 def run_fa4(q, k, v, heads_kv):
-    """Call flash_attn_func. Passes num_heads_kv for GQA."""
+    """Call flash_attn_func. Passes num_heads_kv for GQA.
+    Returns only the output tensor (discards lse if FA4 returns a tuple)."""
     if flash_attn_func is None:
         raise RuntimeError("flash_attn_func not available")
     heads_q = q.shape[2]
     if heads_kv == heads_q:
-        return flash_attn_func(q, k, v)
+        result = flash_attn_func(q, k, v)
     else:
         # FA4 / FA3 API: pass num_heads_kv (or heads_kv) for GQA
         try:
-            return flash_attn_func(q, k, v, num_heads_kv=heads_kv)
+            result = flash_attn_func(q, k, v, num_heads_kv=heads_kv)
         except TypeError:
             # Older FA API uses keyword head_dim or similar; try positional
-            return flash_attn_func(q, k, v)
+            result = flash_attn_func(q, k, v)
+    return result[0] if isinstance(result, (tuple, list)) else result
 
 
 def attn_flops(batch, seqlen, heads_q, headdim, fwd_ms, include_bwd=False):
