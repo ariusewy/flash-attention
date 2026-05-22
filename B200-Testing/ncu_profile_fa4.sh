@@ -287,11 +287,16 @@ fi
   echo
   if [[ -f "$OUTDIR/summary.json" ]]; then
     echo "=== Key Metrics ==="
-    python3 -c "
+    "$PYTHON_BIN" -c "
 import json, sys
 with open('$OUTDIR/summary.json') as f:
     d = json.load(f)
-kernels = d.get('kernels', [d])
+if isinstance(d, list):
+    kernels = []
+    for item in d:
+        kernels.extend(item.get('kernels', [item]) if isinstance(item, dict) else [])
+else:
+    kernels = d.get('kernels', [d])
 for k in kernels[:3]:
     name = k.get('kernel_name', k.get('name', 'unknown'))
     print(f'Kernel: {name[:80]}')
