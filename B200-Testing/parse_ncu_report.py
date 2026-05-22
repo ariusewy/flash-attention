@@ -107,6 +107,55 @@ def _strip_num(s: str):
         return s
 
 
+def _looks_like_csv(text: str) -> bool:
+    """Cheap sanity check: does this look like NCU's --csv output?
+
+    We don't trust ncu's exit code on --import — NCU 2025.x can return 1
+    because the in-report RuleResults fail re-evaluation (e.g. when section
+    files aren't in NSIGHT_COMPUTE_SECTIONS_PATH) while still emitting a
+    perfectly fine CSV body on stdout. Accept anything whose first line
+    starts with a quoted column header (raw page) or contains the canonical
+    'Metric Name'/'Metric Value' header (details page).
+    """
+    if not text:
+        return False
+    head = text.lstrip().splitlines()[0] if text.strip() else ""
+    if head.startswith('"ID"') or head.startswith("\"Process ID\""):
+        return True
+    if "Metric Name" in head and "Metric Value" in head:
+        return True
+    # Fall back to "has at least one comma in the first line" — looser but
+    # still rules out plain error text.
+    return "," in head
+
+
+def _discover_sections_path(ncu_bin: str) -> str:
+    """Best-effort lookup of <ncu install>/sections so --import can
+    re-evaluate rule results without warnings."""
+    env = os.environ.get("NSIGHT_COMPUTE_SECTIONS_PATH", "").strip()
+    if env and os.path.isdir(env):
+        return env
+    # Resolve `ncu` to its install root (typically .../bin/ncu).
+    try:
+        from shutil import which
+        path = which(ncu_bin) or ""
+    except Exception:
+        path = ""
+    if path:
+        root = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+        candidate = os.path.join(root, "sections")
+        if os.path.isdir(candidate):
+            return candidate
+    # Common install locations to try as a last resort.
+    for cand in [
+        "/usr/local/cuda/nsight-compute/sections",
+        "/opt/nvidia/nsight-compute/sections",
+    ]:
+        if os.path.isdir(cand):
+            return cand
+    return ""
+
+
 def _run_ncu_import(cmd: list, timeout: int = 120):
     """Invoke `ncu --import ...` and return (returncode, stdout, stderr)."""
     try:
@@ -130,35 +179,66 @@ def export_csv_text(ncu_path: str, ncu_bin: str = NCU_BIN) -> tuple:
 
     Raises RuntimeError with both attempts' stderr if every variant fails.
     """
-    # NCU 2025.3+ dropped `--units` on `--import` (prints an "unrecognised
-    # option" error and emits empty stdout while still exiting 0). Older NCU
-    # supported it. We try the no-`--units` variants first because they work
-    # on every version we've seen; the parser normalises adaptive units
-    # (us/Mbyte/Ghz/...) back to ns/byte/Hz so the downstream schema is
-    # identical whether or not NCU happened to honour `--units base`.
-    attempts = [
-        ("raw",            [ncu_bin, "--import", ncu_path, "--page", "raw",
-                            "--csv"]),
-        ("details",        [ncu_bin, "--import", ncu_path, "--page", "details",
-                            "--csv"]),
-        ("raw_baseUnits",  [ncu_bin, "--import", ncu_path, "--page", "raw",
-                            "--csv", "--units", "base"]),
-        ("details_baseUnits", [ncu_bin, "--import", ncu_path, "--page",
-                               "details", "--csv", "--units", "base"]),
+    # NCU 2025.3 quirks:
+    #   - `--units` is rejected on --import (prints "unrecognised option"
+    #     to stderr but still exits 0 with empty stdout).
+    #   - The in-report Section/Rule blob is re-evaluated on import; if
+    #     NSIGHT_COMPUTE_SECTIONS_PATH is unset and the rule files aren't
+    #     auto-discovered, ncu exits 1 *after* writing the full CSV body
+    #     to stdout (protobuf "missing required fields" error in stderr).
+    #
+    # So:
+    #   1. Try `--section-folder <auto-found path>` first to silence rule
+    #      re-eval and get a clean exit 0.
+    #   2. If that fails, fall back to the same command without the section
+    #      flag and accept any output that looks like CSV regardless of
+    #      returncode — the data we want is the CSV body, not the rule blob.
+    sections_dir = _discover_sections_path(ncu_bin)
+    section_flag = (["--section-folder", sections_dir] if sections_dir
+                    else [])
+
+    attempts = []
+    if section_flag:
+        attempts += [
+            ("raw_withSections",
+                [ncu_bin, "--import", ncu_path] + section_flag
+                + ["--page", "raw", "--csv"]),
+            ("details_withSections",
+                [ncu_bin, "--import", ncu_path] + section_flag
+                + ["--page", "details", "--csv"]),
+        ]
+    attempts += [
+        ("raw",
+            [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv"]),
+        ("details",
+            [ncu_bin, "--import", ncu_path, "--page", "details", "--csv"]),
+        ("raw_baseUnits",
+            [ncu_bin, "--import", ncu_path, "--page", "raw", "--csv",
+             "--units", "base"]),
+        ("details_baseUnits",
+            [ncu_bin, "--import", ncu_path, "--page", "details", "--csv",
+             "--units", "base"]),
     ]
 
     errors = []
     for tag, cmd in attempts:
         rc, out, err = _run_ncu_import(cmd)
-        # Accept only when ncu actually emitted a CSV body. NCU 2025.x can
-        # exit 0 with an empty stdout when it dislikes a flag, so checking
-        # the body is the only reliable signal.
-        if rc == 0 and out.strip():
+        # Accept whenever ncu emitted something that looks like CSV, even if
+        # rc != 0. The export step writes the CSV before the post-processing
+        # that may fail; the body is the source of truth.
+        if _looks_like_csv(out):
+            if rc != 0:
+                # Keep the warning visible so the operator can fix the
+                # underlying issue (typically NSIGHT_COMPUTE_SECTIONS_PATH).
+                print(f"[parse] [{tag}] ncu rc={rc}, but stdout has CSV body "
+                      f"— accepting. stderr head: "
+                      f"{err.strip().splitlines()[0] if err.strip() else '(empty)'}",
+                      file=sys.stderr)
             return out, tag
         errors.append(f"[{tag}] rc={rc} stderr={err.strip()[:300] or '(empty)'} "
                       f"stdout_head={out.strip()[:120] or '(empty)'}")
 
-    raise RuntimeError("ncu --import failed for every page/units variant:\n"
+    raise RuntimeError("ncu --import produced no CSV for any variant:\n"
                        + "\n".join(errors))
 
 
