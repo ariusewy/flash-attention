@@ -150,31 +150,9 @@ export CUDA_VISIBLE_DEVICES="$GPU_ID"
 PYTHON_CMD="python3 $HERE/bench_fa4_simfa.py"
 PYTHON_CMD="$PYTHON_CMD --mode run_once --seqlen $SEQLEN --headdim $HEADDIM --heads $HEADS --heads-kv $HEADS_KV --batch $BATCH $NO_BWD"
 
-# NCU sections
-if [[ -n "$FULL_MODE" ]]; then
-  SECTIONS=(
-    --section MemoryWorkloadAnalysis
-    --section ComputeWorkloadAnalysis
-    --section SpeedOfLight
-    --section LaunchStats
-    --section SchedulerStats
-    --section InstructionStats
-    --section Occupancy
-    --section MemoryFootprint
-    --section SourceCounters
-  )
-  METRICS_FLAG="--metrics-all"
-else
-  SECTIONS=(
-    --section MemoryWorkloadAnalysis
-    --section ComputeWorkloadAnalysis
-    --section LaunchStats
-    --section Occupancy
-  )
-  # Targeted metrics for Sim-FA calibration
-  METRICS_FLAG=(
-    --metrics
-    "dram__throughput.avg.pct_of_peak_sustained_elapsed,\
+# NCU sections + metrics
+# Targeted metrics needed for Sim-FA calibration (especially TMA byte counters)
+TARGETED_METRICS="dram__throughput.avg.pct_of_peak_sustained_elapsed,\
 dram__bytes_read.sum,\
 dram__bytes_write.sum,\
 lts__t_sectors.sum,\
@@ -199,7 +177,20 @@ smsp__average_warp_latency_issue_stalled_mio_throttle.pct,\
 smsp__average_warp_latency_issue_stalled_not_selected.pct,\
 gpu__time_duration.sum,\
 sm__warps_active.avg.pct_of_peak"
+
+if [[ -n "$FULL_MODE" ]]; then
+  # Full mode: use --set full (NCU 2025+ replacement for --metrics-all)
+  # plus targeted metrics for TMA traffic
+  SECTIONS=(--set full)
+  METRICS_FLAG=(--metrics "$TARGETED_METRICS")
+else
+  SECTIONS=(
+    --section MemoryWorkloadAnalysis
+    --section ComputeWorkloadAnalysis
+    --section LaunchStats
+    --section Occupancy
   )
+  METRICS_FLAG=(--metrics "$TARGETED_METRICS")
 fi
 
 # ---------------------------------------------------------------------------
