@@ -122,7 +122,7 @@ output_file = 'device_kernel_summary.csv'
 header = ['Heads_Q', 'Heads_KV', 'SeqLen', 'Total_Time_us', 'Instances', 'Avg_us', 'Med_us', 'Min_us', 'Max_us', 'StdDev_us']
 data = [header]
 
-for csv_file in sorted(glob.glob(f'{input_dir}/*_kernel_stats.csv*')):
+for csv_file in sorted(glob.glob(f'{input_dir}/*_kernel_stats*.csv*')):
     basename = os.path.basename(csv_file)
     match = re.search(r'fa4_profile_h(\d+)_s(\d+)', basename)
     if not match:
@@ -136,7 +136,7 @@ for csv_file in sorted(glob.glob(f'{input_dir}/*_kernel_stats.csv*')):
         reader = csv.reader(f)
         next(reader)  # skip header
         for row in reader:
-            if len(row) > 8 and 'flash' in row[-1].lower() or 'cutlass' in row[-1].lower() or 'attention' in row[-1].lower():
+            if len(row) > 8 and ('flash' in row[-1].lower() or 'cutlass' in row[-1].lower() or 'attention' in row[-1].lower()):
                 try:
                     total_ns = float(row[1])
                     instances = int(row[2])
