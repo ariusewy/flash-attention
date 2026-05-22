@@ -77,7 +77,7 @@ cd ~/fa4_scripts/scripts    # 下文 $SCRIPTS 均指此目录
 | Driver | ≥ R570 | 支持 sm_100 |
 | CUDA | ≥ 12.8 | Blackwell PTX 支持 |
 | Nsight Compute | ≥ 2025.1 | `ncu` 在 PATH 中 |
-| Conda env | `b200_fa3` | `torch ≥ 2.6`，`flash-attn-4` |
+| Container | python3 + pip3 | 无需 conda，脚本直接使用系统 Python |
 | sudo / 计数器权限 | `--full` NCU 必需 | DRAM / TMA byte counter 需要 |
 
 FA4 安装方式（无需编译源码）：
@@ -122,11 +122,11 @@ bash B200_probe.sh    # 再次确认
 确认 FA4 输出与 PyTorch SDPA 参考一致：
 
 ```bash
-conda run -n b200_fa3 python bench_fa4_simfa.py \
+python3 bench_fa4_simfa.py \
   --mode correctness --cases minimal
 
 # GQA 形状（Llama3-8B 风格）
-conda run -n b200_fa3 python bench_fa4_simfa.py \
+python3 bench_fa4_simfa.py \
   --mode correctness --cases llama3_8b
 ```
 
@@ -139,11 +139,11 @@ conda run -n b200_fa3 python bench_fa4_simfa.py \
 ```bash
 mkdir -p B200-Testing/results/manual_run
 
-conda run -n b200_fa3 python bench_fa4_simfa.py \
+python3 bench_fa4_simfa.py \
   --mode perf --cases small --no-backward \
   -o B200-Testing/results/manual_run/perf_small.json
 
-conda run -n b200_fa3 python bench_fa4_simfa.py \
+python3 bench_fa4_simfa.py \
   --mode perf --cases ncu_sweep --no-backward \
   -o B200-Testing/results/manual_run/perf_ncu_sweep.json
 ```
@@ -217,7 +217,7 @@ run_one 8192 128 8 128
 若只需重新提取指标（例如更新了 `parse_ncu_report.py`），无需重跑 NCU：
 
 ```bash
-conda run -n b200_fa3 python parse_ncu_report.py \
+python3 parse_ncu_report.py \
   B200-Testing/results/manual_run/ncu_s2048_hq32_hkv8_d128/profile.ncu-rep \
   -o B200-Testing/results/manual_run/ncu_s2048_hq32_hkv8_d128/summary.json \
   --csv B200-Testing/results/manual_run/ncu_s2048_hq32_hkv8_d128/profile_calib.csv \
@@ -229,7 +229,7 @@ conda run -n b200_fa3 python parse_ncu_report.py \
 将 Step 3 perf JSON 与 Step 4 NCU 目录合并为一张表：
 
 ```bash
-conda run -n b200_fa3 python B200-Testing/collect_results.py \
+python3 B200-Testing/collect_results.py \
   B200-Testing/results/manual_run \
   -o B200-Testing/results/manual_run/ALL_RESULTS.csv
 ```
@@ -394,10 +394,10 @@ bash B200_probe.sh
 bash B200_setup_fa4.sh
 
 # Correctness
-conda run -n b200_fa3 python bench_fa4_simfa.py --mode correctness --cases minimal
+python3 bench_fa4_simfa.py --mode correctness --cases minimal
 
 # Perf
-conda run -n b200_fa3 python bench_fa4_simfa.py --mode perf --cases ncu_sweep \
+python3 bench_fa4_simfa.py --mode perf --cases ncu_sweep \
   --no-backward -o perf_ncu_sweep.json
 
 # NCU 单 shape
@@ -405,11 +405,11 @@ OUTDIR=./ncu_out GPU_ID=0 sudo -E bash ncu_profile_fa4.sh \
   --seqlen 2048 --heads 32 --heads-kv 8 --headdim 128 --no-backward --full
 
 # 解析
-conda run -n b200_fa3 python parse_ncu_report.py ncu_out/profile.ncu-rep \
+python3 parse_ncu_report.py ncu_out/profile.ncu-rep \
   -o ncu_out/summary.json --pretty
 
 # 汇总
-conda run -n b200_fa3 python B200-Testing/collect_results.py . -o ALL_RESULTS.csv
+python3 B200-Testing/collect_results.py . -o ALL_RESULTS.csv
 
 # 一键
 bash B200-Testing/run_b200_all.sh --smoke
