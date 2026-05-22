@@ -151,7 +151,7 @@ PYTHON_CMD="python3 $HERE/bench_fa4_simfa.py"
 PYTHON_CMD="$PYTHON_CMD --mode run_once --seqlen $SEQLEN --headdim $HEADDIM --heads $HEADS --heads-kv $HEADS_KV --batch $BATCH $NO_BWD"
 
 # NCU sections + metrics
-# Targeted metrics needed for Sim-FA calibration (especially TMA byte counters)
+# Targeted metrics for Sim-FA calibration (TMA/DRAM/L2/TC/stalls + latency)
 TARGETED_METRICS="dram__throughput.avg.pct_of_peak_sustained_elapsed,\
 dram__bytes_read.sum,\
 dram__bytes_write.sum,\
@@ -179,10 +179,15 @@ gpu__time_duration.sum,\
 sm__warps_active.avg.pct_of_peak"
 
 if [[ -n "$FULL_MODE" ]]; then
-  # Full mode: use --set full (NCU 2025+ replacement for --metrics-all)
-  # plus targeted metrics for TMA traffic
-  SECTIONS=(--set full)
-  METRICS_FLAG=(--metrics "$TARGETED_METRICS")
+  SECTIONS=(
+    --section MemoryWorkloadAnalysis
+    --section ComputeWorkloadAnalysis
+    --section SpeedOfLight
+    --section LaunchStats
+    --section SchedulerStats
+    --section Occupancy
+    --section MemoryFootprint
+  )
 else
   SECTIONS=(
     --section MemoryWorkloadAnalysis
@@ -190,21 +195,25 @@ else
     --section LaunchStats
     --section Occupancy
   )
-  METRICS_FLAG=(--metrics "$TARGETED_METRICS")
 fi
+METRICS_FLAG=(--metrics "$TARGETED_METRICS")
+
+# bench_fa4_simfa.py --mode run_once does: warmup (5 calls) + 1 timed call.
+# Each flash attention call launches 1 kernel.
+# Use --launch-skip 5 --launch-count 1 to profile only the 6th (timed) call.
+LAUNCH_FILTER=(--launch-skip 5 --launch-count 1)
 
 # ---------------------------------------------------------------------------
 # 4. Run NCU
 # ---------------------------------------------------------------------------
 echo "[ncu] Profiling FA4 kernel..."
-echo "[ncu] Command: ncu ${SECTIONS[*]} ${METRICS_FLAG[*]} -o $OUTDIR/profile -- $PYTHON_CMD"
+echo "[ncu] Command: ncu ${LAUNCH_FILTER[*]} ${SECTIONS[*]} ${METRICS_FLAG[*]} -o $OUTDIR/profile -- $PYTHON_CMD"
 
 set +e
 timeout "$PROFILE_TIMEOUT" ncu \
   --target-processes all \
   --clock-control=none \
-  --nvtx \
-  --nvtx-include "FA4_FWD/" \
+  "${LAUNCH_FILTER[@]}" \
   "${SECTIONS[@]}" \
   "${METRICS_FLAG[@]}" \
   -o "$OUTDIR/profile" \
