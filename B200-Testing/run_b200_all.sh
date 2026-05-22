@@ -18,7 +18,10 @@
 #   bash run_b200_all.sh --smoke
 #   sudo bash run_b200_all.sh --full --gpu 5
 #   sudo bash run_b200_all.sh --full --outdir /mnt/nvme3n1/b200_results --gpu 5
-#   sudo bash run_b200_all.sh --full --gpu 5 --lock-mhz 1830
+#
+# Clock locking is NOT handled here — lock the SM clock manually before running:
+#   sudo nvidia-smi -i 5 -lgc 1830,1830
+#   sudo nvidia-smi -i 5 -rgc        # restore afterwards
 #
 # Output:
 #   <OUTDIR>/
@@ -42,7 +45,6 @@ set -euo pipefail
 SMOKE=""
 FULL=""
 GPU_ID="${GPU_ID:-0}"
-LOCK_MHZ="${LOCK_MHZ:-}"
 OUTDIR=""
 
 while [[ $# -gt 0 ]]; do
@@ -51,13 +53,12 @@ while [[ $# -gt 0 ]]; do
     --full)      FULL=1;  shift ;;
     --outdir)    OUTDIR="$2"; shift 2 ;;
     --gpu)       GPU_ID="$2"; shift 2 ;;
-    --lock-mhz)  LOCK_MHZ="$2"; shift 2 ;;
     *) echo "[error] Unknown argument: $1"; exit 1 ;;
   esac
 done
 
 if [[ -z "$SMOKE" && -z "$FULL" ]]; then
-  echo "Usage: bash $0 --smoke | --full [--outdir DIR] [--gpu N] [--lock-mhz MHZ]"
+  echo "Usage: bash $0 --smoke | --full [--outdir DIR] [--gpu N]"
   exit 1
 fi
 
@@ -83,20 +84,11 @@ echo "B200 FA4 Profiling Run"
 echo "============================================================"
 echo "Mode     : $([ -n "$FULL" ] && echo 'FULL' || echo 'SMOKE')"
 echo "GPU      : $GPU_ID"
-echo "Lock MHz : ${LOCK_MHZ:-none}"
 echo "Output   : $OUTDIR"
 echo "Date     : $(date)"
+echo "Note     : clock locking is the user's responsibility (not handled here)"
 echo "============================================================"
 echo ""
-
-# Restore default GPU clocks on exit
-cleanup() {
-  if [[ -n "$LOCK_MHZ" ]]; then
-    echo "[cleanup] Restoring default clocks on GPU $GPU_ID..."
-    nvidia-smi -i "$GPU_ID" -rgc >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
 # Helper: run a step, log pass/fail
@@ -116,19 +108,6 @@ check_ncu_perm() {
   fi
   return 1
 }
-
-# ---------------------------------------------------------------------------
-# Step 0: Lock GPU clock (optional)
-# ---------------------------------------------------------------------------
-if [[ -n "$LOCK_MHZ" ]]; then
-  echo "[0/5] Locking SM clock to ${LOCK_MHZ} MHz on GPU ${GPU_ID}..."
-  nvidia-smi -i "$GPU_ID" -pm 1 >/dev/null 2>&1 || true
-  nvidia-smi -i "$GPU_ID" --lock-gpu-clocks="$LOCK_MHZ,$LOCK_MHZ" >/dev/null 2>&1 || {
-    echo "      [warn] clock lock failed, continuing without lock"
-    LOCK_MHZ=""
-  }
-  echo "      Done"
-fi
 
 # ---------------------------------------------------------------------------
 # Step 1: Environment probe

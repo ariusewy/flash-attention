@@ -5,10 +5,10 @@
 # Runs bench_fa4_simfa.py --mode run_once under nsys for each shape,
 # then extracts kernel latency via nsys stats.
 #
-# Usage:
-#   bash run_nsys_fa4.sh
+# Clock locking is NOT handled here — lock the SM clock manually before running:
+#   sudo nvidia-smi -i 5 -lgc 1830,1830
 #   CUDA_VISIBLE_DEVICES=5 bash run_nsys_fa4.sh
-#   LOCK_MHZ=1830 bash run_nsys_fa4.sh
+#   sudo nvidia-smi -i 5 -rgc
 #
 # Output:
 #   nsys_reports/
@@ -17,9 +17,6 @@
 #   device_kernel_summary.csv   (aggregated latency table)
 
 set -euo pipefail
-
-GPU_ID="${GPU_ID:-0}"
-LOCK_MHZ="${LOCK_MHZ:-}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="$HERE/bench_fa4_simfa.py"
@@ -35,25 +32,6 @@ SHAPES=(
   "128 8  8192 128"
 )
 
-# Lock clock if requested
-if [[ -n "$LOCK_MHZ" ]]; then
-  echo "Locking SM clock to ${LOCK_MHZ} MHz on GPU ${GPU_ID}..."
-  nvidia-smi -i "$GPU_ID" -pm 1 >/dev/null 2>&1 || true
-  nvidia-smi -i "$GPU_ID" --lock-gpu-clocks="$LOCK_MHZ,$LOCK_MHZ" >/dev/null 2>&1 || {
-    echo "[warn] clock lock failed"
-    LOCK_MHZ=""
-  }
-fi
-
-cleanup() {
-  if [[ -n "$LOCK_MHZ" ]]; then
-    echo "Restoring clocks on GPU ${GPU_ID}..."
-    nvidia-smi -i "$GPU_ID" -rgc >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-# Check prerequisites
 if [ ! -f "$BENCH" ]; then
   echo "Error: bench_fa4_simfa.py not found at $BENCH"
   exit 1
@@ -63,17 +41,15 @@ command -v nsys >/dev/null 2>&1 || {
   exit 1
 }
 
-# Clean previous runs
 rm -f "$NSYS_TAR"
 rm -rf "$NSYS_DIR"
 mkdir -p "$NSYS_DIR"
 
-export CUDA_VISIBLE_DEVICES="$GPU_ID"
-
 echo "=================================================================="
 echo "FA4 nsys Profiling ($(date))"
 echo "Shapes: ${#SHAPES[@]}"
-echo "GPU: $GPU_ID  Lock: ${LOCK_MHZ:-none}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "Note: clock locking is the user's responsibility (not handled here)"
 echo "=================================================================="
 
 for shape in "${SHAPES[@]}"; do

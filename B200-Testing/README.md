@@ -269,7 +269,12 @@ sudo bash B200-Testing/run_b200_all.sh \
   --gpu 0
 ```
 
-可选参数：`--env b200_fa3`、`--lock-mhz 1600`（锁频以提高可重复性）。
+> **锁频说明**：脚本不再自动管理 GPU 频率。如需固定频率以提高可重复性，请在运行前手动锁定，运行结束后手动释放：
+> ```bash
+> sudo nvidia-smi -i 5 -lgc 1830,1830   # lock SM clock
+> # ... run profiling ...
+> sudo nvidia-smi -i 5 -rgc             # restore
+> ```
 
 ---
 

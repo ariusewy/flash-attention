@@ -5,14 +5,12 @@
 # These shapes match exactly what fa3 profiling on H800 covered:
 #   H_Q in {32, 64, 128} x S in {512, 1024, 2048},  H_KV=8, headdim=128, batch=1
 #
-# Usage:
+# Clock locking is NOT handled here — lock the SM clock manually before running:
+#   sudo nvidia-smi -i 5 -lgc 1830,1830
 #   CUDA_VISIBLE_DEVICES=5 bash run_nsys_fa3_align.sh
-#   LOCK_MHZ=1830 CUDA_VISIBLE_DEVICES=5 bash run_nsys_fa3_align.sh
+#   sudo nvidia-smi -i 5 -rgc
 
 set -euo pipefail
-
-GPU_ID="${GPU_ID:-0}"
-LOCK_MHZ="${LOCK_MHZ:-}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH="$HERE/bench_fa4_simfa.py"
@@ -32,23 +30,6 @@ SHAPES=(
   "128 8  2048 128"
 )
 
-if [[ -n "$LOCK_MHZ" ]]; then
-  echo "Locking SM clock to ${LOCK_MHZ} MHz on GPU ${GPU_ID}..."
-  nvidia-smi -i "$GPU_ID" -pm 1 >/dev/null 2>&1 || true
-  nvidia-smi -i "$GPU_ID" --lock-gpu-clocks="$LOCK_MHZ,$LOCK_MHZ" >/dev/null 2>&1 || {
-    echo "[warn] clock lock failed"
-    LOCK_MHZ=""
-  }
-fi
-
-cleanup() {
-  if [[ -n "$LOCK_MHZ" ]]; then
-    echo "Restoring clocks on GPU ${GPU_ID}..."
-    nvidia-smi -i "$GPU_ID" -rgc >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
 if [ ! -f "$BENCH" ]; then
   echo "Error: bench_fa4_simfa.py not found at $BENCH"
   exit 1
@@ -59,11 +40,10 @@ rm -f "$NSYS_TAR"
 rm -rf "$NSYS_DIR"
 mkdir -p "$NSYS_DIR"
 
-export CUDA_VISIBLE_DEVICES="$GPU_ID"
-
 echo "=================================================================="
 echo "FA4 nsys Profiling (FA3-aligned, 9 shapes) at $(date)"
-echo "GPU: $GPU_ID  Lock: ${LOCK_MHZ:-none}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
+echo "Note: clock locking is the user's responsibility (not handled here)"
 echo "=================================================================="
 
 for shape in "${SHAPES[@]}"; do

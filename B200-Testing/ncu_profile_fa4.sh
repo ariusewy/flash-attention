@@ -26,8 +26,9 @@
 #   # Specific GPU
 #   GPU_ID=2 bash ncu_profile_fa4.sh
 #
-#   # Lock clock for reproducibility
-#   LOCK_MHZ=1600 bash ncu_profile_fa4.sh
+#   # Clock locking is NOT handled here — lock manually if you want it:
+#   #   sudo nvidia-smi -i $GPU_ID -lgc 1830,1830
+#   #   sudo nvidia-smi -i $GPU_ID -rgc
 #
 # Output:
 #   results/ncu-fa4-<seqlen>-<headdim>-<timestamp>/
@@ -44,7 +45,6 @@ set -euo pipefail
 export PATH="/usr/local/cuda/bin:${PATH:-}"
 
 GPU_ID="${GPU_ID:-0}"
-LOCK_MHZ="${LOCK_MHZ:-}"
 PROFILE_TIMEOUT="${PROFILE_TIMEOUT:-600}"
 CONDA_ENV="${CONDA_ENV:-}"
 FULL_METRICS="${FULL_METRICS:-}"
@@ -143,29 +143,10 @@ echo "============================================="
 } > "$OUTDIR/env.txt"
 
 echo "[ncu] Environment logged to env.txt"
+echo "[ncu] Note: clock locking is the user's responsibility (not handled here)"
 
 # ---------------------------------------------------------------------------
-# 2. Lock SM clock (optional, for reproducibility)
-# ---------------------------------------------------------------------------
-if [[ -n "$LOCK_MHZ" ]]; then
-  echo "[ncu] Locking SM clock to ${LOCK_MHZ} MHz on GPU ${GPU_ID}..."
-  nvidia-smi -i "$GPU_ID" -pm 1 >/dev/null 2>&1 || true
-  nvidia-smi -i "$GPU_ID" --lock-gpu-clocks="$LOCK_MHZ" >/dev/null 2>&1 || {
-    echo "[warn] Failed to lock clock (may need sudo). Continuing without lock."
-    LOCK_MHZ=""
-  }
-fi
-
-cleanup() {
-  if [[ -n "$LOCK_MHZ" ]]; then
-    echo "[ncu] Restoring default clocks on GPU ${GPU_ID}..."
-    nvidia-smi -i "$GPU_ID" -rgc >/dev/null 2>&1 || true
-  fi
-}
-trap cleanup EXIT INT TERM
-
-# ---------------------------------------------------------------------------
-# 3. Build the NCU command
+# 2. Build the NCU command
 # ---------------------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 
@@ -225,7 +206,7 @@ METRICS_FLAG=(--metrics "$TARGETED_METRICS")
 LAUNCH_FILTER=(--launch-skip 5 --launch-count 1)
 
 # ---------------------------------------------------------------------------
-# 4. Run NCU
+# 3. Run NCU
 # ---------------------------------------------------------------------------
 echo "[ncu] Profiling FA4 kernel..."
 echo "[ncu] Command: ncu ${LAUNCH_FILTER[*]} ${SECTIONS[*]} ${METRICS_FLAG[*]} -o $OUTDIR/profile -- $PYTHON_CMD"
@@ -247,7 +228,7 @@ set -e
 echo "[ncu] NCU exit code: $NCU_RC (124 = timeout)"
 
 # ---------------------------------------------------------------------------
-# 5. Export CSV from raw report
+# 4. Export CSV from raw report
 # ---------------------------------------------------------------------------
 if [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
   echo "[ncu] Exporting CSV from profile.ncu-rep..."
@@ -259,7 +240,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Parse summary (if parse script exists)
+# 5. Parse summary (if parse script exists)
 # ---------------------------------------------------------------------------
 if [[ -f "$HERE/parse_ncu_report.py" ]] && [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
   echo "[ncu] Parsing report to summary.json..."
@@ -270,7 +251,7 @@ if [[ -f "$HERE/parse_ncu_report.py" ]] && [[ -f "$OUTDIR/profile.ncu-rep" ]]; t
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Print summary
+# 6. Print summary
 # ---------------------------------------------------------------------------
 {
   echo "============================================="
