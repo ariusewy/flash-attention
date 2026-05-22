@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Author: ywangmu from HKUST
 #
-# B200 environment probe - detect GPU, driver, CUDA, ncu, conda, disk, etc.
+# B200 environment probe - detect GPU, driver, CUDA, ncu, Python, disk, etc.
 # Run this first on the B200 server to verify the environment is ready.
 #
 # Usage:
@@ -83,26 +83,15 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# 5. Conda / Python
+# 5. Python packages
 # ---------------------------------------------------------------------------
-echo "--- Conda ---"
-if command -v conda &>/dev/null; then
-    echo "conda: $(conda --version 2>/dev/null)"
-    echo ""
-    echo "Environments:"
-    conda env list 2>/dev/null | grep -v "^#" | while read line; do
-        echo "  $line"
-    done
-    echo ""
-
-    # Check b200_fa3 environment
-    ENV_NAME="${CONDA_ENV:-b200_fa3}"
-    echo "--- Key packages in '$ENV_NAME' ---"
-    conda list -n "$ENV_NAME" 2>/dev/null | grep -iE "torch|flash-attn|cutlass|quack|numpy|einops" || \
-      echo "  (environment '$ENV_NAME' not found or no matching packages)"
-else
-    echo "conda not found"
-fi
+echo "--- Python ---"
+echo "python: $(python3 --version 2>/dev/null || echo 'not found')"
+echo "pip:    $(pip3 --version 2>/dev/null | head -1 || echo 'not found')"
+echo ""
+echo "--- Key packages ---"
+pip3 list 2>/dev/null | grep -iE "torch|flash-attn|cutlass|quack|numpy|einops" || \
+  echo "  (no matching packages found)"
 echo ""
 
 # ---------------------------------------------------------------------------

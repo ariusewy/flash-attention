@@ -7,8 +7,8 @@
 # with Nsight Compute, collects key sections, and exports results.
 #
 # Prerequisites:
-#   - conda activate b200_fa3
-#   - flash-attn-4 (beta 8+) installed
+#   - python3 + pip in PATH
+#   - flash-attn-4 installed (pip install flash-attn-4)
 #   - ncu available on PATH
 #   - sudo / root for GPU counter access (or RestrictProfiling disabled)
 #
@@ -46,7 +46,7 @@ export PATH="/usr/local/cuda/bin:${PATH:-}"
 GPU_ID="${GPU_ID:-0}"
 LOCK_MHZ="${LOCK_MHZ:-}"
 PROFILE_TIMEOUT="${PROFILE_TIMEOUT:-600}"
-CONDA_ENV="${CONDA_ENV:-b200_fa3}"
+CONDA_ENV="${CONDA_ENV:-}"
 FULL_METRICS="${FULL_METRICS:-}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -108,8 +108,8 @@ echo "============================================="
   echo "=== ncu ==="
   ncu --version 2>&1 | head -3 || echo "(ncu not found)"
   echo
-  echo "=== conda env ==="
-  conda list -n "$CONDA_ENV" 2>/dev/null | grep -iE "torch|flash-attn|cutlass|quack" || echo "(conda env '$CONDA_ENV' not found)"
+  echo "=== pip packages ==="
+  pip3 list 2>/dev/null | grep -iE "torch|flash-attn|cutlass|quack" || echo "(pip list failed)"
   echo
   echo "=== /proc/driver/nvidia/params ==="
   grep -i "RestrictProfiling" /proc/driver/nvidia/params 2>/dev/null \
@@ -147,7 +147,7 @@ trap cleanup EXIT INT TERM
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 
 # Python command
-PYTHON_CMD="conda run -n $CONDA_ENV --no-banner python $HERE/bench_fa4_simfa.py"
+PYTHON_CMD="python3 $HERE/bench_fa4_simfa.py"
 PYTHON_CMD="$PYTHON_CMD --mode run_once --seqlen $SEQLEN --headdim $HEADDIM --heads $HEADS --heads-kv $HEADS_KV --batch $BATCH $NO_BWD"
 
 # NCU sections
@@ -240,7 +240,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ -f "$HERE/parse_ncu_report.py" ]] && [[ -f "$OUTDIR/profile.ncu-rep" ]]; then
   echo "[ncu] Parsing report to summary.json..."
-  conda run -n "$CONDA_ENV" --no-banner python "$HERE/parse_ncu_report.py" \
+  python3 "$HERE/parse_ncu_report.py" \
     "$OUTDIR/profile.ncu-rep" -o "$OUTDIR/summary.json" 2>/dev/null || {
     echo "[warn] parse_ncu_report.py failed; skipping summary.json"
   }

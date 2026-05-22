@@ -1,39 +1,35 @@
 #!/usr/bin/env bash
 # Author: ywangmu from HKUST
 #
-# B200 FA4 environment setup script.
-# Run this once on the B200 server to set up the conda environment.
+# B200 FA4 environment setup script (container / bare-metal edition).
+# Assumes a container with Python 3.10+ and pip already available.
+# No conda involved — installs directly into the system Python.
 #
 # Prerequisites:
-#   - CUDA 13.0+ installed (check /usr/local/cuda/bin/nvcc)
-#   - conda or miniconda installed
+#   - CUDA 12.8+ installed (check /usr/local/cuda/bin/nvcc)
+#   - python3 + pip in PATH
 #   - Internet access (for pip installs)
 #
 # Usage:
 #   bash B200_setup_fa4.sh            # full setup
 #   bash B200_setup_fa4.sh --verify   # only verify, don't install
-#   bash B200_setup_fa4.sh --env-name my_env  # custom env name
 
 set -euo pipefail
 
-ENV_NAME="${ENV_NAME:-b200_fa3}"
 VERIFY_ONLY=""
-PYTHON_VER="${PYTHON_VER:-3.12}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --verify)     VERIFY_ONLY="1"; shift ;;
-    --env-name)   ENV_NAME="$2"; shift 2 ;;
-    --python)     PYTHON_VER="$2"; shift 2 ;;
     *)            echo "Unknown arg: $1"; shift ;;
   esac
 done
 
 echo "============================================="
-echo "B200 FA4 Environment Setup"
+echo "B200 FA4 Environment Setup (container mode)"
 echo "============================================="
-echo "  env name : $ENV_NAME"
-echo "  python   : $PYTHON_VER"
+echo "  python   : $(python3 --version 2>&1 || echo '?')"
+echo "  pip      : $(pip3 --version 2>&1 | head -1 || echo '?')"
 echo "  verify   : $([ -n "$VERIFY_ONLY" ] && echo 'yes' || echo 'no (will install)')"
 echo "============================================="
 
@@ -41,12 +37,12 @@ echo "============================================="
 # 1. Check CUDA
 # ---------------------------------------------------------------------------
 echo ""
-echo "[1/6] Checking CUDA..."
+echo "[1/4] Checking CUDA..."
 if [[ -f /usr/local/cuda/bin/nvcc ]]; then
     /usr/local/cuda/bin/nvcc --version | head -5
 else
     echo "[error] nvcc not found at /usr/local/cuda/bin/nvcc"
-    echo "        Install CUDA Toolkit 13.0+ first"
+    echo "        Install CUDA Toolkit 12.8+ first"
     exit 1
 fi
 
@@ -54,7 +50,7 @@ fi
 # 2. Check ncu
 # ---------------------------------------------------------------------------
 echo ""
-echo "[2/6] Checking Nsight Compute..."
+echo "[2/4] Checking Nsight Compute..."
 if command -v ncu &>/dev/null; then
     ncu --version | head -3
 else
@@ -69,32 +65,13 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Create/verify conda environment
+# 3. Install PyTorch + flash-attn-4 + dependencies
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/6] Conda environment '$ENV_NAME'..."
-if conda env list 2>/dev/null | grep -q "$ENV_NAME"; then
-    echo "  Environment '$ENV_NAME' already exists."
-else
-    if [[ -n "$VERIFY_ONLY" ]]; then
-        echo "[error] Environment '$ENV_NAME' not found. Run without --verify to create it."
-        exit 1
-    fi
-    echo "  Creating environment..."
-    conda create -n "$ENV_NAME" python="$PYTHON_VER" -y
-fi
+echo "[3/4] Checking packages..."
 
-# Helper to run in conda env
-run_in_env() {
-    conda run -n "$ENV_NAME" --no-banner "$@"
-}
-
-# ---------------------------------------------------------------------------
-# 4. Install PyTorch
-# ---------------------------------------------------------------------------
-echo ""
-echo "[4/6] Checking PyTorch..."
-PYTORCH_INSTALLED=$(run_in_env python3 -c "
+# PyTorch
+PYTORCH_INSTALLED=$(python3 -c "
 import torch
 print(torch.__version__)
 " 2>/dev/null || echo "")
@@ -106,16 +83,12 @@ else
         echo "[error] PyTorch not installed. Run without --verify to install."
         exit 1
     fi
-    echo "  Installing PyTorch (CUDA 13.0)..."
-    run_in_env pip install torch --index-url https://download.pytorch.org/whl/cu130
+    echo "  Installing PyTorch..."
+    pip3 install torch --index-url https://download.pytorch.org/whl/cu130
 fi
 
-# ---------------------------------------------------------------------------
-# 5. Install flash-attn-4 and dependencies
-# ---------------------------------------------------------------------------
-echo ""
-echo "[5/6] Checking FA4 and dependencies..."
-FA4_INSTALLED=$(run_in_env python3 -c "
+# flash-attn-4
+FA4_INSTALLED=$(python3 -c "
 from flash_attn_interface import flash_attn_func
 print('ok')
 " 2>/dev/null || echo "")
@@ -127,20 +100,29 @@ else
         echo "[warn] flash-attn-4 not installed. Run without --verify to install."
     else
         echo "  Installing flash-attn-4..."
-        run_in_env pip install flash-attn-4
-
-        # Install common dependencies
-        echo "  Installing dependencies..."
-        run_in_env pip install einops numpy
+        pip3 install flash-attn-4
     fi
 fi
 
+# Common dependencies
+for pkg in einops numpy; do
+    python3 -c "import ${pkg}" 2>/dev/null && \
+        echo "  ${pkg}: $(python3 -c "import ${pkg}; print(${pkg}.__version__)" 2>/dev/null)" || {
+        if [[ -z "$VERIFY_ONLY" ]]; then
+            echo "  Installing ${pkg}..."
+            pip3 install "$pkg"
+        else
+            echo "  [warn] ${pkg}: not installed"
+        fi
+    }
+done
+
 # ---------------------------------------------------------------------------
-# 6. Final verification
+# 4. Final verification
 # ---------------------------------------------------------------------------
 echo ""
-echo "[6/6] Final verification..."
-run_in_env python3 -c "
+echo "[4/4] Final verification..."
+python3 -c "
 import sys
 print('=== Package Versions ===')
 import torch
@@ -188,6 +170,5 @@ echo "============================================="
 echo "Setup Complete"
 echo "============================================="
 echo ""
-echo "To activate:  conda activate $ENV_NAME"
 echo "To profile:   bash ncu_profile_fa4.sh --seqlen 128 --headdim 64"
-echo "To benchmark:  python bench_fa4_simfa.py --mode perf --cases small"
+echo "To benchmark: python3 bench_fa4_simfa.py --mode perf --cases small"

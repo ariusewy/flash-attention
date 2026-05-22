@@ -39,7 +39,7 @@ set -euo pipefail
 SMOKE=""
 FULL=""
 GPU_ID="${GPU_ID:-0}"
-CONDA_ENV="${CONDA_ENV:-b200_fa3}"
+CONDA_ENV="${CONDA_ENV:-}"
 LOCK_MHZ="${LOCK_MHZ:-}"
 OUTDIR=""
 
@@ -62,18 +62,18 @@ fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
-[[ -z "$OUTDIR" ]] && OUTDIR="$HERE/results/b200_run_${TS}"
+[[ -z "$OUTDIR" ]] && OUTDIR="$HERE/B200-Testing/results/b200_run_${TS}"
 mkdir -p "$OUTDIR"
 
 export CUDA_VISIBLE_DEVICES="$GPU_ID"
 # Restore PATH if running under sudo
 export PATH="/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
 
-PYTHON="conda run -n $CONDA_ENV --no-banner python"
+PYTHON="python3"
 BENCH="$HERE/bench_fa4_simfa.py"
 NCU_SCRIPT="$HERE/ncu_profile_fa4.sh"
 PARSE="$HERE/parse_ncu_report.py"
-COLLECT="$HERE/collect_results.py"
+COLLECT="$HERE/B200-Testing/collect_results.py"
 
 # Log everything to run_summary.txt as well as stdout
 exec > >(tee -a "$OUTDIR/run_summary.txt") 2>&1
