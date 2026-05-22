@@ -147,8 +147,9 @@ if torch.cuda.is_available():
         q = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16, device='cuda')
         k = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16, device='cuda')
         v = torch.randn(1, 128, 2, 64, dtype=torch.bfloat16, device='cuda')
-        out = flash_attn_func(q, k, v)
+        result = flash_attn_func(q, k, v)
         torch.cuda.synchronize()
+        out = result[0] if isinstance(result, (tuple, list)) else result
         print(f'FA4 smoke test: PASS (output shape={out.shape})')
     else:
         print('FA4: NOT AVAILABLE (install flash-attn-4)')
