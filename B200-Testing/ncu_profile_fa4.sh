@@ -180,13 +180,11 @@ sm__warps_active.avg.pct_of_peak"
 
 if [[ -n "$FULL_MODE" ]]; then
   SECTIONS=(
+    --section SpeedOfLight
     --section MemoryWorkloadAnalysis
     --section ComputeWorkloadAnalysis
-    --section SpeedOfLight
     --section LaunchStats
-    --section SchedulerStats
     --section Occupancy
-    --section MemoryFootprint
   )
 else
   SECTIONS=(
