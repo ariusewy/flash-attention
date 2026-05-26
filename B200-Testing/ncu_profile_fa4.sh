@@ -186,6 +186,11 @@ smsp__sass_thread_inst_executed_ops_fadd_fmul_ffma_pred_on.sum,\
 smsp__sass_thread_inst_executed_op_conversion_pred_on.sum,\
 smsp__sass_thread_inst_executed_op_misc_pred_on.sum,\
 smsp__sass_thread_inst_executed_op_inter_thread_communication_pred_on.sum,\
+smsp__sass_inst_executed_op_tmem.sum,\
+smsp__sass_inst_executed_op_tmem_ldt.sum,\
+smsp__sass_inst_executed_op_tmem_stt.sum,\
+smsp__sass_inst_executed_op_utccp.sum,\
+smsp__sass_inst_executed_op_utcmma.sum,\
 smsp__average_warp_latency_issue_stalled_long_scoreboard.pct,\
 smsp__average_warp_latency_issue_stalled_short_scoreboard.pct,\
 smsp__average_warp_latency_issue_stalled_barrier.pct,\
