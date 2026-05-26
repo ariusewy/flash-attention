@@ -60,12 +60,25 @@ CALIB_METRICS = {
     "sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active":  "tensor_pipe_util_pct",
     "sm__pipe_tensor_cycles_active.sum.pct_of_peak_sustained_elapsed": "tensor_pipe_elapsed_pct",
     "sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active":     "fma_pipe_util_pct",
+    # Softmax-adjacent scalar/math instruction mix
+    "smsp__inst_executed_op_mufu.sum":                                 "mufu_inst",
+    "smsp__inst_executed_op_fadd_pred_on.sum":                         "fadd_inst",
+    "smsp__inst_executed_op_fmul_pred_on.sum":                         "fmul_inst",
+    "smsp__inst_executed_op_ffma_pred_on.sum":                         "ffma_inst",
+    "smsp__inst_executed_op_conversion_pred_on.sum":                   "conversion_inst",
     # Warp / occupancy
     "sm__warps_active.avg.pct_of_peak_sustained_active":               "warps_active_pct",
+    "smsp__warps_eligible.avg.per_cycle_active":                       "warps_eligible_per_cycle",
     "sm__maximum_warps_per_active_cycle_pct":                          "occupancy_pct",
     # Stall breakdown
     "smsp__average_warp_latency_issue_stalled_barrier.pct":            "stall_barrier_pct",
+    "smsp__average_warp_latency_issue_stalled_membar.pct":             "stall_membar_pct",
     "smsp__average_warp_latency_issue_stalled_long_scoreboard.pct":    "stall_long_scoreboard_pct",
+    "smsp__average_warp_latency_issue_stalled_short_scoreboard.pct":   "stall_short_scoreboard_pct",
+    "smsp__average_warp_latency_issue_stalled_math_pipe_throttle.pct": "stall_math_pipe_throttle_pct",
+    "smsp__average_warp_latency_issue_stalled_wait.pct":               "stall_wait_pct",
+    "smsp__average_warp_latency_issue_stalled_mio_throttle.pct":       "stall_mio_throttle_pct",
+    "smsp__average_warp_latency_issue_stalled_not_selected.pct":       "stall_not_selected_pct",
     # Instructions
     "inst_executed":                                                   "inst_executed",
     "sm__inst_executed.sum.per_cycle_active":                          "ipc_active",

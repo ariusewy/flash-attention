@@ -172,15 +172,32 @@ sm__sass_inst_executed_op_tma_st.sum,\
 l1tex__tmain_requests.sum,\
 sm__pipe_tma_cycles_active.avg.pct_of_peak_sustained_active,\
 sm__pipe_tma_cycles_active.sum.pct_of_peak_sustained_elapsed,\
+sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_active,\
+sm__pipe_tensor_cycles_active.sum.pct_of_peak_sustained_elapsed,\
+sm__pipe_fma_cycles_active.avg.pct_of_peak_sustained_active,\
 l1tex__t_sectors_pipe_lsu.sum,\
 sm__inst_executed.sum,\
 smsp__inst_executed_pipe_tensor.sum,\
+smsp__inst_executed_op_mufu.sum,\
+smsp__inst_executed_op_fadd_pred_on.sum,\
+smsp__inst_executed_op_fmul_pred_on.sum,\
+smsp__inst_executed_op_ffma_pred_on.sum,\
+smsp__inst_executed_op_conversion_pred_on.sum,\
 smsp__average_warp_latency_issue_stalled_long_scoreboard.pct,\
+smsp__average_warp_latency_issue_stalled_short_scoreboard.pct,\
 smsp__average_warp_latency_issue_stalled_barrier.pct,\
+smsp__average_warp_latency_issue_stalled_membar.pct,\
+smsp__average_warp_latency_issue_stalled_math_pipe_throttle.pct,\
+smsp__average_warp_latency_issue_stalled_wait.pct,\
 smsp__average_warp_latency_issue_stalled_mio_throttle.pct,\
 smsp__average_warp_latency_issue_stalled_not_selected.pct,\
+smsp__warps_eligible.avg.per_cycle_active,\
 gpu__time_duration.sum,\
-sm__warps_active.avg.pct_of_peak"
+sm__warps_active.avg.pct_of_peak,\
+sm__warps_active.avg.pct_of_peak_sustained_active,\
+launch__waves_per_multiprocessor,\
+launch__registers_per_thread,\
+launch__shared_mem_per_block_dynamic"
 
 if [[ -n "$FULL_MODE" ]]; then
   SECTIONS=(
