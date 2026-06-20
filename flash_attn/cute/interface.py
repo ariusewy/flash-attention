@@ -58,6 +58,55 @@ from flash_attn.cute.block_sparsity import (
     get_block_sparse_broadcast_pattern,
 )
 
+# Author: ywangmu from HKUST
+# cutez.trace integration: optional SM100 intra-kernel tracing.
+# Enable with env vars:
+#   USE_TRACE_FA4=1                  -> enable trace-enabled SM100 kernel path
+#   TRACE_FA4_PATH=/path/out.json    -> output Chrome trace JSON path (default /tmp/fa4_trace.json)
+# When disabled, all _CUTEZ_TRACE_* globals are None and the default path is unchanged.
+_CUTEZ_TRACE_ENABLED = os.environ.get("USE_TRACE_FA4", "0") == "1"
+_CUTEZ_TRACE_PATH = os.environ.get("TRACE_FA4_PATH", "/tmp/fa4_trace.json")
+_CUTEZ_TRACE_SESSION = None
+_CUTEZ_TRACE_CFG = None
+_CUTEZ_TRACE_OUT = None  # cute.Tensor view of the int64 GMEM buffer
+if _CUTEZ_TRACE_ENABLED:
+    try:
+        from cutez.trace.session import CutezTraceSession
+    except ImportError as _e:
+        raise ImportError(
+            "USE_TRACE_FA4=1 but cutez is not installed. "
+            "Install with: pip install -e /workspace/cutez --no-deps"
+        ) from _e
+    _CUTEZ_TRACE_SESSION = CutezTraceSession(
+        # Buffer sizing: since disable_smem=True writes trace directly to GMEM, this
+        # value only controls the GMEM segment layout and is NOT constrained by physical
+        # SMEM. Enlarged from 48128 to 262144 so each segment (~5461 words) can hold
+        # ~280 tiles of MMA-internal events (~18 word/tile) without ring-buffer wraparound
+        # for large seqlen runs. Total GMEM = 262144 * total_blocks.
+        block_available_bytes=16777216,
+        segments_per_block=6,  # softmax0 / softmax1 / correction / mma / epilogue / load
+        trace_path=_CUTEZ_TRACE_PATH,
+        # Hide coarse outer scopes (kept only to satisfy MLIR dominance when per-tile
+        # scopes mutate tracer.clock_idx) and softmax-internal wait_S. Only per-tile
+        # *_tile scopes and MMA pipeline stages appear in the Chrome trace.
+        hidden_scopes=("load", "mma", "epilogue", "softmax", "correction",
+                   "load_tile", "mma_tile", "softmax_tile", "correction_tile", "epilogue_tile"),
+        disable_smem=True,  # write trace directly to GMEM to avoid SMEM clobbering by FA4 pipeline
+        # Emit raw GPU clock cycles as ts/dur (not ns). Clock rate is recorded in
+        # trace metadata (clock_rate_khz) so absolute time can be recovered by
+        # t_ns = cycles * 1e6 / clock_rate_khz. Author: ywangmu from HKUST.
+        output_unit="ns",
+    )
+    _CUTEZ_TRACE_CFG = _CUTEZ_TRACE_SESSION.trace_config
+    # Session creates the buffer without enable_tvm_ffi, but FA4 SM100 interface compiles with
+    # --enable-tvm-ffi and requires all runtime tensors to be TVM-FFI tensors. Re-wrap the same
+    # underlying storage (DLPack shares memory) so compile/call accept it. Session.decode still
+    # operates on session.buffer_tensor (torch), which views the same memory.
+    from cutlass.cute.runtime import from_dlpack as _from_dlpack_tvmffi
+    _CUTEZ_TRACE_OUT = _from_dlpack_tvmffi(
+        _CUTEZ_TRACE_SESSION.buffer_tensor.detach(), assumed_align=8, enable_tvm_ffi=True
+    )
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -722,6 +771,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        _CUTEZ_TRACE_ENABLED,  # cutez.trace: separate cache entry for trace-enabled path
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -908,6 +958,9 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    trace_cfg=_CUTEZ_TRACE_CFG if (
+                        _CUTEZ_TRACE_ENABLED and flash_fwd_obj_cls is FlashAttentionForwardSm100
+                    ) else None,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -981,6 +1034,9 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
             ])
+            # cutez.trace: trace_out (cute.Tensor or None) must be passed positionally before stream.
+            # Passed unconditionally so the positional order matches __call__(... aux_tensors, trace_out, stream).
+            compile_args.append(_CUTEZ_TRACE_OUT)
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1053,7 +1109,16 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            # cutez.trace: reset GMEM buffer before launch and pass trace_out positionally.
+            # Passed unconditionally (None when disabled) so positional order matches compile.
+            if _CUTEZ_TRACE_ENABLED and _CUTEZ_TRACE_SESSION is not None:
+                _CUTEZ_TRACE_SESSION.reset_buffer()
+            call_args.append(_CUTEZ_TRACE_OUT)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            # cutez.trace: decode buffer and write Chrome trace JSON.
+            if _CUTEZ_TRACE_ENABLED and _CUTEZ_TRACE_SESSION is not None:
+                _CUTEZ_TRACE_SESSION.write_trace_json()
+                fa_logging.fa_log(1, f"[cutez.trace] written to: {_CUTEZ_TRACE_SESSION.trace_path}")
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

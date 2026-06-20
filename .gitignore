@@ -41,3 +41,7 @@ benchmarks/results/
 
 # compile-time generated file
 flash_attn_config.py
+
+# B200 trace collection outputs (large, regenerated per run)
+B200-Testing/results/
+B200-Testing/archive_*/

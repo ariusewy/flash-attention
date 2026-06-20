@@ -66,6 +66,16 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
+
+# Author: ywangmu from HKUST
+# cutez.trace integration: optional, enabled only when self.trace_cfg is not None.
+# Imports are deferred to __init__ / kernel to avoid hard dependency on cutez when tracing is off.
+_CUTEZ_TRACE_AVAILABLE = False
+try:
+    from cutez.trace.core import CutezTracer, TraceConfig  # noqa: F401
+    _CUTEZ_TRACE_AVAILABLE = True
+except ImportError:
+    pass
 from flash_attn.cute.utils import smid
 
 # === TUNING KNOBS (agent-editable) ===
@@ -134,6 +144,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        trace_cfg=None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -314,6 +325,16 @@ class FlashAttentionForwardSm100:
 
         self.buffer_align_bytes = 1024
 
+        # cutez.trace: store config; when not None, _setup_attributes reduces kv_stage
+        # to free SMEM for the per-warp trace buffer (see kv_stage - 3 below).
+        self.trace_cfg = trace_cfg
+        self.trace_enabled = trace_cfg is not None
+        if self.trace_enabled and not _CUTEZ_TRACE_AVAILABLE:
+            raise ImportError(
+                "trace_cfg was provided but cutez.trace is not installed. "
+                "Install cutez (pip install -e /workspace/cutez --no-deps) or pass trace_cfg=None."
+            )
+
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
 
@@ -334,6 +355,10 @@ class FlashAttentionForwardSm100:
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
+        if getattr(self, "trace_enabled", False):
+            # cutez.trace: free SMEM for the per-warp trace buffer.
+            # Mirrors deciding/cutez reference (kv_stage - 3 for segments_per_block=4).
+            kv_stage = max(1, kv_stage - 3)
         self.kv_stage = kv_stage
         # print("kv_stage", self.kv_stage)
         self.s_stage = 2
@@ -374,6 +399,9 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # cutez.trace: optional trace buffer (torch int64 tensor wrapped as cute.Tensor).
+        # When None, tracing is fully disabled and the default path is unchanged.
+        trace_out: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -764,6 +792,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            trace_out,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -811,6 +840,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        trace_out: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -848,6 +878,46 @@ class FlashAttentionForwardSm100:
         # Alloc
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+
+        # cutez.trace: create per-warp tracer. When self.trace_cfg is None we still create
+        # a disabled tracer (cfg.enabled=False) so that downstream scope calls can be emitted
+        # unconditionally — this satisfies CuTeDSL's SSA dominance rule (branch-local mutation
+        # of clock_idx inside _record would otherwise violate it). The disabled tracer's
+        # _record() early-returns at compile time via const_expr(not self.enabled), so the
+        # generated PTX for the default path is unchanged.
+        # Mapping (stable for the 16-warp SM100 layout), must match segments_per_block=6:
+        #   seg 0: warp 0-3   (softmax0)
+        #   seg 1: warp 4-7   (softmax1)
+        #   seg 2: warp 8-11  (correction)
+        #   seg 3: warp 12    (mma)
+        #   seg 4: warp 13    (epilogue)
+        #   seg 5: warp 14    (load)
+        # warp 15 (empty/clc) maps to seg 6, filtered by init_clock's recording_block check.
+        _trace_seg = cutlass.Int32(
+            cutlass.min(warp_idx // 4, 3) + cutlass.max(0, warp_idx - 12)
+        )
+        if const_expr(self.trace_enabled):
+            tracer = CutezTracer.create(
+                trace_out,
+                seg_idx=_trace_seg,
+                smem=smem,
+                cfg=self.trace_cfg,
+            )
+        else:
+            # Disabled tracer: all enter_scope/exit_scope compile away via const_expr.
+            from cutez.trace.core import TraceConfig as _TC
+            _disabled_cfg = _TC(
+                block_smem_bytes=0,
+                segment_bytes=0,
+                smem_words=0,
+                enabled=False,
+            )
+            tracer = CutezTracer.create(
+                trace_out,
+                seg_idx=_trace_seg,
+                smem=smem,
+                cfg=_disabled_cfg,
+            )
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierFwdSm100.TmemPtr),
@@ -1136,6 +1206,8 @@ class FlashAttentionForwardSm100:
         #  LOAD
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.load_warp_ids[0] and warp_idx <= self.load_warp_ids[-1]:
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("load")
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_qk,
@@ -1158,12 +1230,18 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tracer=tracer,
             )
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("load")
+                tracer.flush()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("mma")
             cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Alloc tensor memory buffer
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
@@ -1189,17 +1267,23 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tracer=tracer,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("mma")
+                tracer.flush()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(not self.use_correction_warps_for_epi):
             if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
+                if const_expr(self.trace_enabled):
+                    tracer.enter_scope("epilogue")
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 self.epilogue_s2g(
                     mO,
@@ -1212,7 +1296,11 @@ class FlashAttentionForwardSm100:
                     SeqlenInfoCls,
                     mma_tile_coord_v,
                     tile_scheduler=tile_scheduler,
+                    tracer=tracer,
                 )
+                if const_expr(self.trace_enabled):
+                    tracer.exit_scope("epilogue")
+                    tracer.flush()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
@@ -1221,6 +1309,8 @@ class FlashAttentionForwardSm100:
             (const_expr(self.q_stage == 2) and warp_idx <= self.softmax1_warp_ids[-1]) or
             (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1])
         ):
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("softmax")
             # increase register after decreasing
             cute.arch.setmaxregister_increase(self.num_regs_softmax)
             # sync with mma warp before retrieving tmem ptr
@@ -1249,6 +1339,7 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tracer=tracer,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1262,11 +1353,16 @@ class FlashAttentionForwardSm100:
                     softmax_loop(stage=1, tStS=tStS)
 
             tmem_alloc_barrier.arrive()
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("softmax")
+                tracer.flush()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx >= self.correction_warp_ids[0] and warp_idx < self.mma_warp_id:
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("correction")
             cute.arch.setmaxregister_decrease(self.num_regs_correction)
             # sync with mma warp before retrieving tmem ptr
             tmem.wait_for_alloc()
@@ -1295,8 +1391,12 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                tracer=tracer,
             )
             tmem_alloc_barrier.arrive()
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("correction")
+                tracer.flush()
 
         return
 
@@ -1323,6 +1423,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
+        tracer=None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1342,6 +1443,8 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("load_tile")
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
 
@@ -1464,17 +1567,33 @@ class FlashAttentionForwardSm100:
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
                     if issue_kv_for_this_warp:
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("load_tma_K")
                         load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("load_tma_K")
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if issue_q_for_this_warp:
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("load_tma_Q")
                         load_Q(block=0, stage=0)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("load_tma_Q")
                     if issue_kv_for_this_warp:
                         kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("load_tma_Q")
                         load_Q(block=1, stage=1)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("load_tma_Q")
                     q_producer_phase ^= 1
                     if issue_kv_for_this_warp:
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("load_tma_V")
                         load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("load_tma_V")
                         kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
@@ -1487,9 +1606,17 @@ class FlashAttentionForwardSm100:
                             paged_kv_manager.load_page_table(n_block)
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
                         if issue_kv_for_this_warp:
+                            if const_expr(self.trace_enabled):
+                                tracer.enter_scope("load_tma_K")
                             load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                            if const_expr(self.trace_enabled):
+                                tracer.exit_scope("load_tma_K")
                             kv_producer_state.advance()
+                            if const_expr(self.trace_enabled):
+                                tracer.enter_scope("load_tma_V")
                             load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                            if const_expr(self.trace_enabled):
+                                tracer.exit_scope("load_tma_V")
                             kv_producer_state.advance()
 
             else:
@@ -1511,6 +1638,9 @@ class FlashAttentionForwardSm100:
                 )
 
 
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("load_tile")
+                tracer.flush()
             work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
@@ -1542,6 +1672,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
+        tracer=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1635,6 +1766,8 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("mma_tile")
             seqlen = SeqlenInfoCls(batch_idx)
 
             block_iter_count = Int32(0)
@@ -1660,6 +1793,8 @@ class FlashAttentionForwardSm100:
                     process_tile = n_block_min < n_block_max
 
             if process_tile and is_leader_cta:
+                if const_expr(self.trace_enabled):
+                    tracer.enter_scope("2gemm_Si")
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
@@ -1685,6 +1820,9 @@ class FlashAttentionForwardSm100:
                     # gemm_Si[stage](tCrB=tSrKi)
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
+                if const_expr(self.trace_enabled):
+                    tracer.exit_scope("2gemm_Si")
+                    tracer.flush()
                 mma_q_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -1699,7 +1837,11 @@ class FlashAttentionForwardSm100:
                 for i in cutlass.range(block_loop_count, unroll=1):
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
+                    if const_expr(self.trace_enabled):
+                        tracer.enter_scope("wait_V")
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    if const_expr(self.trace_enabled):
+                        tracer.exit_scope("wait_V")
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
@@ -1708,13 +1850,19 @@ class FlashAttentionForwardSm100:
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile.
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("wait_P0" if stage == 0 else "wait_P1")
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("wait_P0" if stage == 0 else "wait_P1")
                         # 3. gemm
                         # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("gemm_Pi0" if stage == 0 else "gemm_Pi1")
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
@@ -1723,6 +1871,8 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("gemm_Pi0" if stage == 0 else "gemm_Pi1")
                         # Don't need to signal O_full to the correction warps since the
                         # correction warps wait for the softmax warps anyway. By the time the softmax
                         # warps finished, S_i for the next iteration must have been done, so O_i-1
@@ -1736,9 +1886,13 @@ class FlashAttentionForwardSm100:
 
                         # GEMM_QK0i (Q0 * Ki -> S0)
                         # 1. wait for Ki
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("wait_K0" if stage == 0 else "wait_K1")
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("wait_K0" if stage == 0 else "wait_K1")
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         # 2. gemm
                         # Don't need to wait for the softmax warp to have finished reading the previous
@@ -1749,9 +1903,13 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("gemm_Si0" if stage == 0 else "gemm_Si1")
                         gemm_Si[stage](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                         )
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("gemm_Si0" if stage == 0 else "gemm_Si1")
                         # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
@@ -1772,6 +1930,8 @@ class FlashAttentionForwardSm100:
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
+                if const_expr(self.trace_enabled):
+                    tracer.enter_scope("2gemm_Pi")
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
@@ -1796,12 +1956,18 @@ class FlashAttentionForwardSm100:
                     # tile of the next work tile has been computed yet.
                     pipeline_o_acc.producer_commit_w_index(stage)
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
+                if const_expr(self.trace_enabled):
+                    tracer.exit_scope("2gemm_Pi")
+                    tracer.flush()
                 P_full_O_rescaled_phase ^= 1
                 # 5. release Vi_end
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("mma_tile")
+                tracer.flush()
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
@@ -1864,6 +2030,7 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        tracer=None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1929,6 +2096,8 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("softmax_tile")
             kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -2046,10 +2215,15 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                tracer=tracer,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
+                if const_expr(self.trace_enabled):
+                    tracer.enter_scope("wait_S")
                 pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+                if const_expr(self.trace_enabled):
+                    tracer.exit_scope("wait_S")
                 sm_stats_producer_phase ^= 1
 
             # Block sparse or dense iteration
@@ -2100,14 +2274,18 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
-                    mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                    mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, _s_clk = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
                         s0_s1_sequence_phase,
                         n_block_max - 1,
                         is_first=True,
                         mask_fn=partial(mask_fn, mask_seqlen=True),
+                        tracer=tracer,
+                        clock_idx=tracer.clock_idx if tracer is not None else None,
                     )
+                    if tracer is not None:
+                        tracer.clock_idx = _s_clk
                     n_block_max -= 1
                     # Next couple of iterations with causal masking
                     if const_expr(self.is_causal or self.is_local):
@@ -2116,15 +2294,19 @@ class FlashAttentionForwardSm100:
                         )
                         for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                             n_block = n_block_max - 1 - n_tile
-                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = (
+                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, _s_clk = (
                                 softmax_step(
                                     mma_si_consumer_phase,
                                     sm_stats_producer_phase,
                                     s0_s1_sequence_phase,
                                     n_block,
                                     mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    tracer=tracer,
+                                    clock_idx=tracer.clock_idx if tracer is not None else None,
                                 )
                             )
+                            if tracer is not None:
+                                tracer.clock_idx = _s_clk
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
                     # The remaining iterations have no masking (but may still need mask_mod)
                     n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -2133,28 +2315,40 @@ class FlashAttentionForwardSm100:
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
                         if const_expr(self.mask_mod is not None):
-                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, _s_clk = softmax_step(
                                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
+                                tracer=tracer,
+                                clock_idx=tracer.clock_idx if tracer is not None else None,
                             )
+                            if tracer is not None:
+                                tracer.clock_idx = _s_clk
                         else:
-                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
+                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, _s_clk = softmax_step(
                                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
+                                tracer=tracer,
+                                clock_idx=tracer.clock_idx if tracer is not None else None,
                             )
+                            if tracer is not None:
+                                tracer.clock_idx = _s_clk
                     # Separate iterations with local masking on the left
                     if const_expr(self.is_local and block_info.window_size_left is not None):
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                         for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - n_tile
-                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = (
+                            mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, _s_clk = (
                                 softmax_step(
                                     mma_si_consumer_phase,
                                     sm_stats_producer_phase,
                                     s0_s1_sequence_phase,
                                     n_block,
                                     mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    tracer=tracer,
+                                    clock_idx=tracer.clock_idx if tracer is not None else None,
                                 )
                             )
+                            if tracer is not None:
+                                tracer.clock_idx = _s_clk
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
@@ -2185,6 +2379,9 @@ class FlashAttentionForwardSm100:
             #     if tidx < seqlen.seqlen_q - (m_block * 2 + stage) * self.m_block_size:
             #         gLSE[tidx] = lse
 
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("softmax_tile")
+                tracer.flush()
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
@@ -2227,7 +2424,9 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
-    ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
+        tracer=None,
+        clock_idx=None,
+    ) -> Tuple[cute.Int32, cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
         This method processes one block of the attention matrix, computing numerically stable
@@ -2253,7 +2452,11 @@ class FlashAttentionForwardSm100:
         tScP_shape = (tScS_shape[0], tilePlikeFP32)  # (128, 64)
 
         # Wait for Si
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.enter_scope_c("wait_Si", clock_idx)
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.exit_scope_c("wait_Si", clock_idx)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
@@ -2275,6 +2478,8 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.enter_scope_c("softmax_compute", clock_idx)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
@@ -2312,6 +2517,10 @@ class FlashAttentionForwardSm100:
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.exit_scope_c("softmax_compute", clock_idx)
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.enter_scope_c("store_P", clock_idx)
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
             if const_expr(self.split_P_arrive > 0):
@@ -2321,6 +2530,8 @@ class FlashAttentionForwardSm100:
                     cute.arch.fence_view_async_tmem_store()
                     pipeline_s_p_o.consumer_release_w_index(stage)
         # Notify mma warp that the 2nd half of P is ready
+        if tracer is not None and clock_idx is not None:
+            clock_idx = tracer.exit_scope_c("store_P", clock_idx)
         cute.arch.fence_view_async_tmem_store()
         if const_expr(self.split_P_arrive > 0):
             cute.arch.sync_warp()
@@ -2331,7 +2542,7 @@ class FlashAttentionForwardSm100:
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
-        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
+        return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1, clock_idx
 
     @cute.jit
     def correction_loop(
@@ -2359,6 +2570,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        tracer=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2391,6 +2603,8 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("correction_tile")
             kv_head_idx = self._kv_head_idx(head_idx)
             qk_descale, v_descale = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
             if const_expr(self.score_mod is None):
@@ -2451,7 +2665,11 @@ class FlashAttentionForwardSm100:
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("corr_wait_stats")
                         sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("corr_wait_stats")
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -2463,7 +2681,11 @@ class FlashAttentionForwardSm100:
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
                         # pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                         if should_rescale:
+                            if const_expr(self.trace_enabled):
+                                tracer.enter_scope("corr_rescale")
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                            if const_expr(self.trace_enabled):
+                                tracer.exit_scope("corr_rescale")
                         # Notify mma warp that O has been rescaled
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
@@ -2516,7 +2738,11 @@ class FlashAttentionForwardSm100:
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
+                    if const_expr(self.trace_enabled):
+                        tracer.enter_scope("corr_wait_O")
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
+                    if const_expr(self.trace_enabled):
+                        tracer.exit_scope("corr_wait_O")
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
                     gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
@@ -2632,6 +2858,9 @@ class FlashAttentionForwardSm100:
                             )
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("correction_tile")
+                tracer.flush()
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
@@ -2842,11 +3071,14 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         mma_tile_coord_v: Int32 = 0,
         tile_scheduler=None,
+        tracer=None,
     ):
         epi_consumer_phase = Int32(0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            if const_expr(self.trace_enabled):
+                tracer.enter_scope("epilogue_tile")
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -2871,7 +3103,11 @@ class FlashAttentionForwardSm100:
                     for stage in cutlass.range(self.q_stage, unroll_full=True):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
+                        if const_expr(self.trace_enabled):
+                            tracer.enter_scope("epi_wait_O")
                         pipeline_o_epi.consumer_wait_w_index_phase(stage, epi_consumer_phase)
+                        if const_expr(self.trace_enabled):
+                            tracer.exit_scope("epi_wait_O")
                         # 2. copy O0 / O1 to gmem
                         store_O(src_idx=stage, dst_idx=stage)
                         cute.arch.cp_async_bulk_commit_group()
@@ -2898,6 +3134,9 @@ class FlashAttentionForwardSm100:
 
                 epi_consumer_phase ^= 1
 
+            if const_expr(self.trace_enabled):
+                tracer.exit_scope("epilogue_tile")
+                tracer.flush()
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
 
