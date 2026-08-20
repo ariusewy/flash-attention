@@ -23,9 +23,12 @@ from flash_attn.cute import utils
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 from mask_mod_definitions import (
     get_mask_pair,
+    get_vec_mask,
     random_doc_id_tensor,
     STATIC_MASKS,
     PARAMETERIZED_MASK_FACTORIES,
+    EXTRA_SCALAR_MASKS,
+    make_packed_mask_aux_tensor,
     cute_global_packed_doc_mask,
     cute_global_ima_mask,
     cute_global_causal_window_mask,
@@ -614,8 +617,156 @@ def test_varlen_global_masks(seqlens_q, seqlens_k, mask_name):
 
 
 # =============================================================================
+# Vectorized mask_mod equality tests (varlen)
+# Pattern: scalar mask is reference; vec mask at multiple __vec_size__ values
+# must produce bit-identical output.
+# =============================================================================
+
+# (mask_name, window_size, needs_aux)
+VEC_MASK_TEST_CASES = [
+    ("causal", None, False),
+    ("block_causal", None, False),
+    ("sliding_window", 128, False),
+    ("block_diagonal", None, False),
+    ("prefix_lm", None, False),
+    ("packed_aux", None, True),
+]
+
+# Vectorized mask_mod application is currently implemented for SM100/SM110 forward.
+# vec_size > 32 is only supported by packed_aux (other vec mods return shape-(1,) Uint32).
+VEC_MASK_SIZES_TO_CHECK_EQUALITY = [2, 8, 32, 128]
+
+
+def _run_varlen_mask_only(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, mask_mod, aux_tensors, pack_gqa
+):
+    out = torch.empty_like(q)
+    _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        causal=False,
+        softcap=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        learnable_sink=None,
+        tile_mn=(128, 128),
+        pack_gqa=pack_gqa,
+        _arch=None,
+        score_mod=None,
+        mask_mod=mask_mod,
+        block_sparse_tensors=None,
+        return_lse=False,
+        aux_tensors=aux_tensors,
+    )
+    return out
+
+
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS_SMOKE)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+@pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
+def test_varlen_mask_mod_vectorized(seqlens_q, seqlens_k, dtype, kv_mode, mask_case):
+    """Tests equality between scalar and vectorized mask mods on varlen inputs."""
+    if COMPUTE_CAPABILITY not in (10, 11):
+        pytest.skip("vectorized mask_mod application is SM100/SM110-only")
+    mask_name, window_size, needs_aux = mask_case
+
+    if mask_name == "block_causal":
+        offsets = [sk - sq for sq, sk in zip(seqlens_q, seqlens_k)]
+        if len(set(offsets)) > 1:
+            pytest.skip(
+                "block_causal captures offset as compile-time constant; "
+                "varlen with different per-sequence offsets not supported"
+            )
+    if mask_name == "sliding_window":
+        for sq, sk in zip(seqlens_q, seqlens_k):
+            if sq > sk:
+                pytest.skip(
+                    "sliding_window requires seqlen_q <= seqlen_k for each sequence"
+                )
+
+    torch.manual_seed(42)
+    num_heads = 8
+    if kv_mode == "gqa":
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
+        num_kv_heads = 2
+    else:
+        num_kv_heads = num_heads
+    pack_gqa = num_heads != num_kv_heads
+    head_dim = 128
+
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
+        seqlens_q, seqlens_k, num_heads, num_kv_heads, head_dim, dtype
+    )
+
+    batch_size = len(seqlens_q)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    if needs_aux:
+        aux_tensors = [
+            make_packed_mask_aux_tensor(batch_size, max_seqlen_q, max_seqlen_k)
+        ]
+        scalar_mod = EXTRA_SCALAR_MASKS[mask_name]
+    else:
+        aux_tensors = None
+        scalar_mod, _ = get_mask_pair(
+            mask_name,
+            seqlen_q=max_seqlen_q,
+            seqlen_k=max_seqlen_k,
+            window_size=window_size,
+        )
+
+    out_ref = _run_varlen_mask_only(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, scalar_mod, aux_tensors, pack_gqa
+    )
+
+    for vec_size in VEC_MASK_SIZES_TO_CHECK_EQUALITY:
+        if vec_size > 32 and mask_name != "packed_aux":
+            continue
+        vec_mod = get_vec_mask(
+            mask_name,
+            seqlen_q=max_seqlen_q,
+            seqlen_k=max_seqlen_k,
+            window_size=window_size,
+            vec_size=vec_size,
+        )
+        if vec_mod is None:
+            pytest.skip(f"no vec mask for {mask_name}")
+        vec_mod.__vec_size__ = vec_size
+        out = _run_varlen_mask_only(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, vec_mod, aux_tensors, pack_gqa
+        )
+        assert torch.equal(out, out_ref), (
+            f"{mask_name} vec_size={vec_size}: output mismatch vs scalar reference"
+        )
+
+
+# =============================================================================
 # Block sparsity end-to-end tests
 # =============================================================================
+
+
+@cute.jit
+def cute_all_true_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    return m_idx >= utils.scalar_to_ssa(0, cutlass.Int32)
 
 
 def _make_block_sparse_tensors(
@@ -691,6 +842,7 @@ def _run_fwd(
     seqused_k=None,
     block_sparse_tensors=None,
     aux_tensors=None,
+    num_splits=1,
 ):
     out = torch.empty_like(q)
     return _flash_attn_fwd(
@@ -718,6 +870,7 @@ def _run_fwd(
         block_sparse_tensors=block_sparse_tensors,
         return_lse=False,
         aux_tensors=aux_tensors,
+        num_splits=num_splits,
     )[0]
 
 
@@ -889,6 +1042,301 @@ def test_varlen_block_sparse(
     assert max_err <= 0.01, (
         f"block-sparse output differs from mask-mod-only by {max_err}"
     )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
+@pytest.mark.parametrize("seqlens_k", [[512, 512], [384, 384], [128, 128]])
+@pytest.mark.parametrize("varlen_k", [False, True])
+def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k):
+    torch.manual_seed(42)
+    device = "cuda"
+    seqlens_q = [512, 512]
+    num_heads = 1
+    head_dim = 128
+    dtype = torch.bfloat16
+    physical_tile_n = 128
+    sparse_tile_m = 256
+    sparse_tile_n = 256
+
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    if varlen_k:
+        k = torch.randn(sum(seqlens_k), num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        cu_seqlens_k = torch.tensor(
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        k = torch.randn(
+            len(seqlens_k), max(seqlens_k), num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn_like(k)
+        cu_seqlens_k = None
+    mask_mod = get_mask_pair("block_diagonal")[0]
+    block_sparse_tensors = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads,
+        tile_m=sparse_tile_m,
+        tile_n=sparse_tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+    out_with_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    out_no_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+    max_err = (out_with_block_sparsity - out_no_block_sparsity).abs().max().item()
+    assert max_err <= 0.01, (
+        f"varlen coarse-KV block-sparse output differs from mask-mod-only by {max_err} "
+        f"with physical tile_n={physical_tile_n} and sparse tile_n={sparse_tile_n}"
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
+@pytest.mark.parametrize("k_mode,num_splits,seed", [("packed", 3, 14), ("seqused", 1, 15)])
+def test_varlen_block_sparse_coarse_kv_requires_offsets(k_mode, num_splits, seed):
+    """Variable-K packed metadata must provide per-batch index offsets."""
+    torch.manual_seed(seed)
+    device = "cuda"
+    seqlens_q = [257, 128, 513]
+    seqlens_k = [1025, 513, 129]
+    num_heads = 2
+    head_dim = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 256
+    sparse_tile_n = 384
+
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    if k_mode == "packed":
+        k = torch.randn(sum(seqlens_k), num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        cu_seqlens_k = torch.tensor(
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device=device,
+            dtype=torch.int32,
+        )
+        seqused_k = None
+    else:
+        k = torch.randn(
+            len(seqlens_k), max(seqlens_k), num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn_like(k)
+        cu_seqlens_k = None
+        seqused_k = torch.tensor(seqlens_k, device=device, dtype=torch.int32)
+
+    mask_mod = get_mask_pair(
+        "causal",
+        seqlen_q=max(seqlens_q),
+        seqlen_k=max(seqlens_k),
+    )[0]
+    block_sparse_tensors_with_offsets = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads,
+        tile_m=sparse_tile_m,
+        tile_n=sparse_tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+    block_sparse_tensors_without_offsets = block_sparse_tensors_with_offsets._replace(
+        cu_block_idx_offsets=None
+    )
+
+    out_with_offsets = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        block_sparse_tensors=block_sparse_tensors_with_offsets,
+        num_splits=num_splits,
+    )
+    with pytest.raises(
+        ValueError,
+        match="requires block_sparse_tensors.cu_block_idx_offsets",
+    ):
+        _run_fwd(
+            q,
+            k,
+            v,
+            mask_mod,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            block_sparse_tensors=block_sparse_tensors_without_offsets,
+            num_splits=num_splits,
+        )
+    out_no_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+
+    with_offsets_err = (out_with_offsets - out_no_block_sparsity).abs().max().item()
+    assert with_offsets_err <= 0.01
+
+
+VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS = [
+    ([128], [2048]),
+    ([96], [1536]),
+    ([128, 64], [2048, 1024]),
+    ([1, 128], [256, 2048]),
+]
+
+VARLEN_BLOCK_SPARSE_SPLITKV_MASKS = [
+    "all_true",
+    "causal",
+    "sliding_window",
+    "prefix_lm",
+    "block_diagonal",
+]
+
+
+def _get_splitkv_varlen_mask(mask_name, max_seqlen_q, max_seqlen_k):
+    match mask_name:
+        case "all_true":
+            return cute_all_true_mask
+        case "causal":
+            return get_mask_pair("causal", seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k)[0]
+        case "sliding_window":
+            return get_mask_pair(
+                "sliding_window",
+                seqlen_q=max_seqlen_q,
+                seqlen_k=max_seqlen_k,
+                window_size=512,
+            )[0]
+        case _:
+            return get_mask_pair(mask_name)[0]
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV forward only")
+@pytest.mark.parametrize("use_seqused_k", [False, True])
+@pytest.mark.parametrize("mask_name", VARLEN_BLOCK_SPARSE_SPLITKV_MASKS)
+@pytest.mark.parametrize("seqlens_q,seqlens_k", VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS)
+def test_varlen_block_sparse_splitkv_matches_unsplit(seqlens_q, seqlens_k, mask_name, use_seqused_k):
+    """Varlen block-sparse SplitKV should match the unsplit block-sparse path."""
+    torch.manual_seed(123)
+    random.seed(123)
+    device = "cuda"
+    num_heads = 4
+    head_dim = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 256 if sum(seqlens_q) > 128 else 128
+    tile_n = 128
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    mask_mod = _get_splitkv_varlen_mask(mask_name, max_seqlen_q, max_seqlen_k)
+
+    if use_seqused_k:
+        k = torch.randn(
+            len(seqlens_k), max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn_like(k)
+        cu_seqlens_k = None
+        seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    else:
+        k = torch.randn(sum(seqlens_k), num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        cu_seqlens_k = torch.tensor(
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device=device,
+            dtype=torch.int32,
+        )
+        seqused_k = None
+
+    block_sparse_tensors = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=1,
+        tile_m=sparse_tile_m,
+        tile_n=tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+
+    out_unsplit = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    out_split = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        block_sparse_tensors=block_sparse_tensors,
+        num_splits=3,
+    )
+    out_no_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+
+    assert not torch.isnan(out_split).any(), "NaN in SplitKV block-sparse output"
+    assert torch.isfinite(out_split).all(), "Inf in SplitKV block-sparse output"
+    assert (out_unsplit - out_no_block_sparsity).abs().max().item() <= 0.01
+    assert (out_split - out_no_block_sparsity).abs().max().item() <= 0.01
 
 
 if __name__ == "__main__":

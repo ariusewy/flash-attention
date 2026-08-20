@@ -86,7 +86,8 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        # Include the final partially populated wave of rows.
+        page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
@@ -105,7 +106,8 @@ class PagedKVManager(ParamsBase):
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
             # When V is transposed in gmem, dv is shape[0]; otherwise dv is shape[1] (same as K)
-            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[0 if v_gmem_transposed else 1])
+            V_limit = cute.size(mV_paged.shape[0 if v_gmem_transposed else 1])
+            tVpV = utils.predicate_k(tVcV, limit=V_limit)
 
         return PagedKVManager(
             mPageTable,
@@ -154,7 +156,7 @@ class PagedKVManager(ParamsBase):
             self.tPrPageOffset[i] = page_offset
 
     @cute.jit
-    def compute_X_ptr(self, K_or_V: str):
+    def compute_X_ptr(self, K_or_V: str, d_offset: int = 0):
         tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
         mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
         # K is always (page_size, d, num_pages). V matches K when not transposed,
@@ -164,9 +166,9 @@ class PagedKVManager(ParamsBase):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(transposed):
-                tPrXPtr[i] = utils.elem_pointer(mX, (0, page_offset, page)).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (d_offset, page_offset, page)).toint()
             else:
-                tPrXPtr[i] = utils.elem_pointer(mX, (page_offset, 0, page)).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (page_offset, d_offset, page)).toint()
         return tPrXPtr
 
     @cute.jit

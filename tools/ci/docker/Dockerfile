@@ -25,6 +25,7 @@ RUN uv pip install --system --break-system-packages --no-cache --pre \
 # The package itself (version 0.0.0 via setuptools-scm fallback) is overwritten at
 # step time by the editable install from the mounted repo.
 COPY flash_attn/cute/ /tmp/fa4/
-RUN uv pip install --system --break-system-packages --no-cache "/tmp/fa4[cu13,dev]"
+# Keep pre-releases enabled so future development-build dependency floors remain resolvable.
+RUN uv pip install --system --break-system-packages --no-cache --prerelease=allow "/tmp/fa4[cu13,dev]"
 
 CMD ["/bin/bash"]

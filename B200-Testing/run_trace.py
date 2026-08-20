@@ -136,7 +136,7 @@ def run_one_subprocess(label, b, s, hq, hkv, hd, causal, skip_existing=True) -> 
     if skip_existing and trace_path.exists() and (out_dir / "summary.json").exists():
         with open(out_dir / "summary.json") as f:
             summ = json.load(f)
-        print(f"\n[{label}] SKIP (trace already exists, {summ["total_events"]} events)")
+        print(f"\n[{label}] SKIP (trace already exists, {summ['total_events']} events)")
         return {
             "label": label, "batch": b, "seqlen": s,
             "heads_q": hq, "heads_kv": hkv, "headdim": hd,

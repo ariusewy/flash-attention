@@ -24,7 +24,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     SM100_TMEM_CAPACITY_COLUMNS,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
@@ -660,7 +660,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cutlass.Int64, self.mma_compute_dKdV_stage * 2
             ]
             tmem_holding_buf: cutlass.Int32
-            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[Int32, 4]
             # Smem tensors
@@ -1029,11 +1029,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         tmem.allocate(self.tmem_alloc_cols)
@@ -1062,7 +1062,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 pipeline.Agent.Thread, num_clc_consumer_threads
             )
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
+            clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),

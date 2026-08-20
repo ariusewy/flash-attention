@@ -41,6 +41,8 @@ benchmarks/results/
 
 # compile-time generated file
 flash_attn_config.py
+# but keep the committed package shim that re-exports it
+!hopper/flash_attn_3/flash_attn_config.py
 
 # B200 trace collection outputs (large, regenerated per run)
 B200-Testing/results/
