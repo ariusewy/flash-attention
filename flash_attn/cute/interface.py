@@ -86,12 +86,17 @@ _CUTEZ_TRACE_CFG = None
 _CUTEZ_TRACE_OUT = None  # cute.Tensor view of the int64 GMEM buffer
 if _CUTEZ_TRACE_ENABLED:
     try:
+        from cutez.trace.fa4 import register_fa4_forward_regions
         from cutez.trace.session import CutezTraceSession
     except ImportError as _e:
         raise ImportError(
-            "USE_TRACE_FA4=1 but cutez is not installed. "
-            "Install with: pip install -e /workspace/cutez --no-deps"
+            "USE_TRACE_FA4=1 requires cutez-fa4-latest/fa4-trace-integration. "
+            "Install it with: pip install -e /workspace/cutez --no-deps"
         ) from _e
+    # Scope IDs are embedded in the compiled kernel. Register them before JIT
+    # lookup so persistent-cache hits decode to the same semantic names as a
+    # fresh compilation.
+    _CUTEZ_TRACE_REGION_NAMES = register_fa4_forward_regions()
     _CUTEZ_TRACE_SESSION = CutezTraceSession(
         # Buffer sizing: since disable_smem=True writes trace directly to GMEM, this
         # value only controls the GMEM segment layout and is NOT constrained by physical
@@ -101,15 +106,15 @@ if _CUTEZ_TRACE_ENABLED:
         block_available_bytes=16777216,
         segments_per_block=6,  # softmax0 / softmax1 / correction / mma / epilogue / load
         trace_path=_CUTEZ_TRACE_PATH,
+        region_names=_CUTEZ_TRACE_REGION_NAMES,
         # Hide coarse outer scopes (kept only to satisfy MLIR dominance when per-tile
         # scopes mutate tracer.clock_idx) and softmax-internal wait_S. Only per-tile
         # *_tile scopes and MMA pipeline stages appear in the Chrome trace.
         hidden_scopes=("load", "mma", "epilogue", "softmax", "correction",
                    "load_tile", "mma_tile", "softmax_tile", "correction_tile", "epilogue_tile"),
         disable_smem=True,  # write trace directly to GMEM to avoid SMEM clobbering by FA4 pipeline
-        # Emit raw GPU clock cycles as ts/dur (not ns). Clock rate is recorded in
-        # trace metadata (clock_rate_khz) so absolute time can be recovered by
-        # t_ns = cycles * 1e6 / clock_rate_khz. Author: ywangmu from HKUST.
+        # Convert raw GPU clock cycles to ns and record clock_rate_khz in trace
+        # metadata. Author: ywangmu from HKUST.
         output_unit="ns",
     )
     _CUTEZ_TRACE_CFG = _CUTEZ_TRACE_SESSION.trace_config
